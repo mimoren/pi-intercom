@@ -121,7 +121,7 @@ test("roster filtering uses live location without blocking explicit delivery", {
     for (const id of ["self", "same-tab", "other-tab", "outside", "shell"]) {
       const client = new IntercomClient();
       clients.push(client);
-      await client.connect({ ...registration(id, Date.now()), ...(id === "shell" ? {} : { herdrPaneId: id }) }, id);
+      await client.connect({ ...registration(`peer-${id}`, Date.now()), ...(id === "shell" ? {} : { herdrPaneId: id }) }, id);
     }
     const ids = async () => (await clients[0]!.listSessions()).map(item => item.id).sort();
     const all = ["other-tab", "outside", "same-tab", "self", "shell"];
@@ -130,7 +130,12 @@ test("roster filtering uses live location without blocking explicit delivery", {
     assert.deepEqual(await ids(), ["other-tab", "same-tab", "self"]);
     setScope("tab");
     assert.deepEqual(await ids(), ["same-tab", "self"]);
-    assert.equal((await clients[0]!.send("outside", { text: "explicit synthetic delivery" })).delivered, true);
+    for (const to of ["outside", "peer-outside"]) {
+      for (const expectsReply of [false, true]) {
+        const result = await clients[0]!.send(to, { text: "explicit synthetic delivery", expectsReply });
+        assert.equal(result.delivered, true, `hidden peer remains reachable: ${to}, expectsReply=${expectsReply}`);
+      }
+    }
     writeFileSync(snapshotPath, JSON.stringify({ ...snapshot, panes: panes.filter(item => item.pane_id !== "self") }));
     assert.deepEqual(await ids(), all, "unresolved viewer fails open");
     setScope("invalid");
