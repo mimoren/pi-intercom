@@ -40,7 +40,7 @@ import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
 import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import { formatHandoverMessage, generateHandoverBody, readGitState } from "./handover.ts";
 import { isIdleWakePending, releaseIdleWake, reserveIdleWake } from "./idle-wake.ts";
-import { createSessionMentionProvider, extractSessionMentions, notificationPrompt, resolveSessionMentions, workspaceMentionPeers } from "./session-mentions.ts";
+import { createSessionMentionProvider, extractSessionMentions, notificationContext, notificationPrompt, resolveSessionMentionBinding, resolveSessionMentions, sessionMentionBinding, sessionMentionDescription, sessionMentionLabel, workspaceMentionPeers, MENTION_OWNER_EVENT, MENTION_READY_EVENT, type MentionOwnerV1, type MentionProviderV1, type SessionMentionBinding } from "./session-mentions.ts";
 
 const INTERCOM_TOOL_NAME = "intercom";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
@@ -96,6 +96,7 @@ interface DeliveryRequest {
   handover?: boolean;
   /** Explicit workspace notifications never infer a reply target. */
   notification?: boolean;
+  targetEpoch?: string;
   noWake?: boolean;
 }
 
@@ -731,7 +732,11 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let disposed = true;
   let runtimeStarted = false;
   let runtimeGeneration = 0;
-  const selectedMentions = new Map<string, string>();
+  const selectedMentions = new Map<string, SessionMentionBinding>();
+  let mentionOwnerDetected = false;
+  let mentionOwner: MentionOwnerV1 | undefined;
+  let unregisterMentionProvider: (() => void) | undefined;
+  let mentionOwnerError: string | undefined;
   const pendingMentionPrompts: Array<{ text: string; prompt: string; createdAt: number }> = [];
   const mentionPrompts = new Map<string, string>();
   let mentionCache: { generation: number; client: IntercomClient; expiresAt: number; promise: Promise<SessionInfo[]> } | null = null;
@@ -1694,6 +1699,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     const ctx = getLiveContext();
     if (!ctx) throw new Error("Intercom session is no longer active.");
     const activeClient = await ensureConnected("overlay");
+    if (!activeClient.supportsFeature(EXACT_SEND_FEATURE)) throw new Error("Session notifications require a broker with exact endpoint delivery.");
     if (cached && mentionCache?.generation === generation && mentionCache.client === activeClient && mentionCache.expiresAt > Date.now()) {
       return mentionCache.promise;
     }
@@ -1709,6 +1715,83 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       );
     }
     return promise;
+  }
+  const mentionAdapter: MentionProviderV1 = {
+    id: "pi-intercom",
+    async listCandidates() {
+      return (await listMentionPeers()).map((session) => ({
+        id: session.id,
+        label: sessionMentionLabel(session),
+        description: sessionMentionDescription(session),
+        binding: sessionMentionBinding(session),
+      }));
+    },
+    async buildContext({ targets }) {
+      if (!Array.isArray(targets) || targets.length === 0) throw new Error("Select a notification recipient from the @ menu.");
+      const peers = await listMentionPeers();
+      const validated = new Map<string, SessionInfo>();
+      for (const candidate of targets) {
+        const target = resolveSessionMentionBinding(candidate.binding, peers);
+        if (candidate.id !== target.id) throw new Error("The selected session identity changed. Select the recipient again.");
+        validated.set(target.id, target);
+      }
+      return notificationContext([...validated.values()]);
+    },
+  };
+  function stopLegacyMentions(): void {
+    mentionOwnerDetected = true;
+    selectedMentions.clear();
+    pendingMentionPrompts.length = 0;
+    mentionPrompts.clear();
+    mentionCache = null;
+    getLiveContext()?.ui?.setStatus?.("intercom-mentions", undefined);
+  }
+  function reportMentionOwnerError(error: unknown): void {
+    const message = `Intercom @ adapter unavailable: ${getErrorMessage(error)}. Legacy mentions are disabled while a CLIM owner is present.`;
+    if (mentionOwnerError === message) return;
+    mentionOwnerError = message;
+    const ctx = getLiveContext();
+    if (ctx) notifyCommand(ctx, message, "warning");
+  }
+  function discoverMentionOwner(): void {
+    if (!config.enabled) return;
+    let value: unknown;
+    let replied = false;
+    let accepting = true;
+    try {
+      pi.events.emit(MENTION_OWNER_EVENT, { reply: (owner: unknown) => {
+        if (!accepting || replied) return;
+        value = owner;
+        replied = true;
+      } });
+    } catch (error) {
+      stopLegacyMentions();
+      reportMentionOwnerError(error);
+      return;
+    } finally {
+      accepting = false;
+    }
+    if (!replied) {
+      if (mentionOwnerDetected) reportMentionOwnerError(new Error("CLIM did not return a synchronous owner"));
+      return;
+    }
+    stopLegacyMentions();
+    if (value === mentionOwner && unregisterMentionProvider) return;
+    const previous = unregisterMentionProvider;
+    unregisterMentionProvider = undefined;
+    mentionOwner = undefined;
+    try {
+      previous?.();
+      const owner = value as Partial<MentionOwnerV1> | null;
+      if (!owner || owner.version !== 1 || typeof owner.registerProvider !== "function") throw new Error("Unsupported CLIM mention owner");
+      const unregister = owner.registerProvider(mentionAdapter);
+      if (typeof unregister !== "function") throw new Error("CLIM mention owner did not return an unregister function");
+      unregisterMentionProvider = unregister;
+      mentionOwner = owner as MentionOwnerV1;
+      mentionOwnerError = undefined;
+    } catch (error) {
+      reportMentionOwnerError(error);
+    }
   }
   async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
     const sessions = await activeClient.listSessions();
@@ -1893,6 +1976,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         if (signal?.aborted) throw new Error("Notification cancelled before delivery.");
         notificationTarget = (await listMentionPeers()).find((session) => session.id === to);
         if (!notificationTarget) throw new Error("Notification recipient is no longer connected in this workspace. Select the recipient again.");
+        if (request.targetEpoch !== undefined && notificationTarget.endpointEpoch !== request.targetEpoch) {
+          throw new Error("Notification recipient endpoint changed after selection. Select the recipient again.");
+        }
         if (!notificationTarget.endpointEpoch || !connectedClient.supportsFeature(EXACT_SEND_FEATURE)) {
           throw new Error("The broker must support exact endpoint delivery for notifications. Upgrade the broker and try again.");
         }
@@ -2279,32 +2365,44 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     });
   });
   const unsubscribeOutboxRequest = pi.events.on(INTERCOM_OUTBOX_REQUEST_EVENT, handleOutboxRequest);
+  const unsubscribeMentionReady = pi.events.on(MENTION_READY_EVENT, () => {
+    stopLegacyMentions();
+    discoverMentionOwner();
+  });
+  discoverMentionOwner();
   pi.on("session_start", (_event, ctx) => {
     if (!config.enabled) {
       return;
     }
     startSessionRuntime(ctx);
-    if (ctx.mode === "tui" && typeof ctx.ui?.addAutocompleteProvider === "function") {
+    const pendingOwnerError = mentionOwnerError;
+    discoverMentionOwner();
+    if (pendingOwnerError && mentionOwnerError === pendingOwnerError) notifyCommand(ctx, mentionOwnerError, "warning");
+    if (!mentionOwnerDetected && ctx.mode === "tui" && typeof ctx.ui?.addAutocompleteProvider === "function") {
       ctx.ui.addAutocompleteProvider((current) => createSessionMentionProvider(
         current,
         () => listMentionPeers(true),
         (message) => { if (getLiveContext()) ctx.ui.setStatus("intercom-mentions", message); },
-        (token, sessionId) => { selectedMentions.set(token, sessionId); },
+        (token, binding) => { selectedMentions.set(token, binding); },
+        () => !mentionOwnerDetected,
       ));
-    } else if (ctx.mode === "tui") {
+    } else if (!mentionOwnerDetected && ctx.mode === "tui") {
       ctx.ui?.notify?.("Session @ mentions require Pi's extension autocomplete support. Update Pi to use the @ menu; /intercom remains available.", "warning");
     }
   });
   pi.on("input", async (event, ctx) => {
-    if (!config.enabled || ctx.mode !== "tui" || event.source !== "interactive") return { action: "continue" };
+    if (!config.enabled || mentionOwnerDetected || ctx.mode !== "tui" || event.source !== "interactive") return { action: "continue" };
     const generation = runtimeGeneration;
     try {
       const mentions = extractSessionMentions(event.text);
       if (mentions.length === 0) return { action: "continue" };
-      const targets = resolveSessionMentions(mentions, await listMentionPeers(), selectedMentions);
+      const peers = await listMentionPeers();
+      if (mentionOwnerDetected || !getLiveContext(ctx, generation)) return { action: "continue" };
+      const targets = resolveSessionMentions(mentions, peers, selectedMentions);
       pendingMentionPrompts.push({ text: event.text, prompt: notificationPrompt(event.text, targets), createdAt: Date.now() });
       return { action: "continue" };
     } catch (error) {
+      if (mentionOwnerDetected) return { action: "continue" };
       if (getLiveContext(ctx, generation)) {
         const reason = getErrorMessage(error);
         pi.appendEntry("intercom_notification_draft", { text: event.text, reason, timestamp: Date.now() });
@@ -2315,7 +2413,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
   });
   pi.on("context", (event) => {
-    if (pendingMentionPrompts.length === 0 && mentionPrompts.size === 0) return;
+    if (mentionOwnerDetected || (pendingMentionPrompts.length === 0 && mentionPrompts.size === 0)) return;
     // Only the provider-bound copy is expanded; the editor and session history keep the user's text.
     const messages = [...event.messages];
     for (let index = messages.length - 1; index >= 0; index--) {
@@ -2345,6 +2443,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     unsubscribeSubagentControlIntercom();
     unsubscribeSubagentResultIntercom();
     unsubscribeOutboxRequest();
+    unsubscribeMentionReady();
+    try { unregisterMentionProvider?.(); } catch (error) { reportMentionOwnerError(error); }
+    unregisterMentionProvider = undefined;
+    mentionOwner = undefined;
     shuttingDown = true;
     disposed = true;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session shutting down");
@@ -2767,6 +2869,9 @@ Usage:
       message: Type.Optional(Type.String({
         description: "Message to send (for 'send', 'notify', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
       })),
+      targetEpoch: Type.Optional(Type.String({
+        description: "For notify only: exact endpoint epoch selected by @. Keep the supplied value; a changed endpoint is rejected. Older direct notifications may omit it.",
+      })),
       attachments: Type.Optional(Type.Array(Type.Object({
         type: StringEnum(["file", "snippet", "context"] as const),
         name: Type.String(),
@@ -2812,7 +2917,10 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
+      const { action, to, message, targetEpoch, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
+      if (targetEpoch !== undefined && action !== "notify") {
+        return { content: [{ type: "text", text: "targetEpoch is only supported by notify." }], details: { error: true } };
+      }
 
       switch (action) {
         case "list": {
@@ -2930,10 +3038,10 @@ Usage:
         }
 
         case "notify": {
-          if (!to || !message?.trim() || cwd || openProjectPaneIfMissing || replyTo || supersedes || retryOf || attachments?.length || noWake) {
+          if (!to || !message?.trim() || (targetEpoch !== undefined && (typeof targetEpoch !== "string" || !targetEpoch.trim())) || cwd || openProjectPaneIfMissing || replyTo || supersedes || retryOf || attachments?.length || noWake) {
             return { content: [{ type: "text", text: "notify requires an exact workspace session ID and a composed message; routing, reply, attachment and noWake options are not supported." }], details: { error: true } };
           }
-          return deliverMessage(connectedClient, ctx, _signal, { to, message, notification: true });
+          return deliverMessage(connectedClient, ctx, _signal, { to, message, targetEpoch, notification: true });
         }
         case "send": {
           if ((!to && !cwd) || !message) {

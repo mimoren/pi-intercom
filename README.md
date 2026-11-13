@@ -86,14 +86,16 @@ Press **h** on a highlighted session to hand this session over to it instead (se
 
 ### Mention a session with `@`
 
-In the interactive Pi editor, type `@` to pick another connected session in the current Herdr workspace. The menu includes sessions in other projects and tabs, and shows their aliases, directories and status. Use `/alias` to give a session a readable role name.
+In the interactive Pi editor, type `@` to pick another connected session in the current Herdr workspace. The menu includes sessions in other projects and tabs, and shows their session names, directories and status. Use `/alias` to give a session a readable name.
+
+With a compatible CLIM session-mentions owner installed, Intercom registers as a candidate and notification provider; CLIM owns the menu and input handling. Without that owner, Intercom keeps its standalone menu. An incompatible owner or failed provider registration reports an error and disables the old menu, preventing duplicate input handling.
 
 1. Type `@` and filter by name or project.
 2. Select a recipient with the arrow keys and Enter or Tab. This inserts a mention such as `@frontend[12345678]`; it does not send anything.
 3. Add an instruction, for example `@frontend[12345678] explain the pagination decision we just agreed on`, then submit the prompt.
 4. The current AI uses the conversation to compose and send a self-contained notification, then reports the delivery result. Multiple selected recipients receive separate notifications. The editor and session history keep the original prompt; notification instructions are added only to the model's context.
 
-Mentions are bound to the full session ID selected from the menu. Recipients are checked again on submission and before sending. If one disconnects or moves to another workspace, select it again; a failed submission saves the unsent draft in session history and restores it when the editor is empty. Code examples and ordinary email addresses do not trigger notifications. While the AI is working, submissions follow Pi's normal steering or follow-up behavior.
+Mentions are bound to the full session ID and endpoint selected from the menu. Recipients are checked again on submission and before sending. If one disconnects, reconnects or moves to another workspace, select it again; a failed submission saves the unsent draft in session history and restores it when the editor is empty. Code examples and ordinary email addresses do not trigger notifications. While the AI is working, submissions follow Pi's normal steering or follow-up behavior.
 
 File completion remains available with `@./`, `@/`, `@~/`, or quoted paths. Session mentions require Pi's extension autocomplete support and a resolved Herdr workspace. Only sessions connected to the same Intercom routing scope are available; an unavailable workspace never falls back to the machine-wide roster.
 
@@ -425,6 +427,7 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 | `action` | string | `"list"`, `"list-cwd"`, `"send"`, `"notify"`, `"ask"`, `"handover"`, `"reply"`, `"pending"`, `"status"`, or `"cancel"` |
 | `to` | string | Target session name or ID. Without `cwd`, send/ask resolve it globally. With `cwd`, send/ask require the target to be in that directory. Also disambiguates reply. |
 | `message` | string | Message text (for send/notify/ask/reply), or the optional next task for `handover` |
+| `targetEpoch` | string | For notify only: endpoint selected by `@`; a changed endpoint is rejected. Older direct notifications may omit it. |
 | `attachments` | array | Optional `file`, `snippet`, or `context` attachments |
 | `replyTo` | string | Optional message ID for threading or replying to an `ask` |
 | `messageId` | string | Optional explicit message ID for send/ask, or required message ID for `cancel` |
@@ -456,7 +459,7 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 **`send`** — Sends a message to the specified session and returns immediately after delivery. If the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply `send` to a different target is rejected so a guessed parent/root CWD cannot receive an accidental reply. Zero or multiple pending-ask matches remain unthreaded sends outside the active ask turn. Set `confirmSend: true` to confirm ordinary and inferred sends. A caller-supplied `replyTo` skips confirmation. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
 
-**`notify`** — Sends an AI-composed new notification to an exact, currently connected session ID in the same Herdr workspace. Used by the `@` mention flow. It never infers `replyTo` or completes an unrelated pending ask, and honors `confirmSend`. Requires `to` and `message`; directory routing, attachments, reply, supersede, retry and `noWake` options are not supported. A missing or moved recipient fails rather than queueing offline mail.
+**`notify`** — Sends an AI-composed new notification to an exact, currently connected session ID in the same Herdr workspace. Used by the `@` mention flow. It never infers `replyTo` or completes an unrelated pending ask, and honors `confirmSend`. Requires `to` and `message`; directory routing, attachments, reply, supersede, retry and `noWake` options are not supported. `@` requests also carry `targetEpoch`, which must match the endpoint selected from the menu; an empty or changed epoch fails without substitution. Older direct calls may omit it and bind to the endpoint live at tool execution, so they do not guarantee the same endpoint as an earlier selection. A missing or moved recipient fails rather than queueing offline mail.
 
 **`ask`** — Requires a currently connected recipient, sends a message, and waits for the recipient to reply (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). A disconnected target fails immediately rather than queueing a blocking request. The reply is returned as the tool result. No confirmation dialog. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working. The same `to`, `cwd`, and `openProjectPaneIfMissing` targeting rules apply.
 

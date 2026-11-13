@@ -1397,6 +1397,69 @@ test("workspace mentions select recipients, request AI composition and deliver i
             assert.equal(received.length, 1);
             // Unknown workspace identity must not fall back to the machine-wide roster.
             assert.deepEqual(await setup.planner.listSessions({ locationScope: "workspace" }), []);
+
+            // A late CLIM owner takes over all three legacy hooks without a second menu.
+            moveOnConfirm = false;
+            snapshot.panes[1]!.workspace_id = "workspace-a";
+            snapshot.panes[1]!.tab_id = "tab-b";
+            writeFileSync(snapshotPath, JSON.stringify(snapshot));
+            const { MENTION_OWNER_EVENT, MENTION_READY_EVENT } = await import("./session-mentions.ts");
+            let adapter: import("./session-mentions.ts").MentionProviderV1 | undefined;
+            let registrations = 0;
+            let unregistrations = 0;
+            const owner = { version: 1, registerProvider(value: import("./session-mentions.ts").MentionProviderV1) {
+              registrations++;
+              adapter = value;
+              return () => { unregistrations++; adapter = undefined; };
+            } };
+            let activeOwner: unknown = owner;
+            harness!.pi.events.on(MENTION_OWNER_EVENT, (payload) => (payload as { reply: (owner: unknown) => void }).reply(activeOwner));
+            harness!.pi.events.emit(MENTION_READY_EVENT, { version: 1 });
+            harness!.pi.events.emit(MENTION_READY_EVENT, { version: 1 });
+            assert.equal(registrations, 1, "repeated owner ready/query is idempotent");
+            assert.ok(adapter);
+            const candidates = await adapter.listCandidates();
+            assert.equal(candidates.length, 1);
+            assert.equal(candidates[0]!.label, registration.name);
+            assert.equal(candidates[0]!.id, "mention-peer-full-id");
+            const appendix = await adapter.buildContext({ text: "unique-user-body", targets: candidates });
+            assert.ok(!appendix.includes("unique-user-body"), "provider returns only the context appendix");
+            assert.match(appendix, /targetEpoch/);
+            assert.deepEqual((await harness!.emitLifecycleResults("input", { source: "interactive", text: input }))[0], { action: "continue" });
+            assert.equal((await harness!.emitLifecycleResults("context", { messages: [original] }))[0], undefined, "legacy model context is disabled after takeover");
+            await assert.rejects(() => adapter!.buildContext({ text: input, targets: [{ ...candidates[0]!, id: "wrong-id" }] }), /identity changed/);
+            const selectedEpoch = (candidates[0]!.binding as { endpointEpoch: string }).endpointEpoch;
+            await peer.disconnect();
+            await peer.connect({ ...registration, herdrPaneId: "mention-peer" }, "mention-peer-full-id");
+            await assert.rejects(() => adapter!.buildContext({ text: input, targets: candidates }), /endpoint changed/);
+            const changedEndpoint = await tool.execute("notify-old-selected-epoch", { action: "notify", to: "mention-peer-full-id", targetEpoch: selectedEpoch, message: "must not reach replacement" }, signal, undefined, harness!.ctx);
+            assert.equal(changedEndpoint.details?.error, true);
+            assert.match(changedEndpoint.content[0]!.text, /endpoint changed after selection/);
+            assert.equal(received.length, 1);
+            const freshCandidates = await adapter.listCandidates();
+            const freshEpoch = (freshCandidates[0]!.binding as { endpointEpoch: string }).endpointEpoch;
+            assert.notEqual(freshEpoch, selectedEpoch);
+            const fresh = await tool.execute("notify-current-selected-epoch", { action: "notify", to: "mention-peer-full-id", targetEpoch: freshEpoch, message: "composed for the selected endpoint" }, signal, undefined, harness!.ctx);
+            assert.equal(fresh.details?.delivered, true);
+            await waitForCondition(() => received.length === 2, "notification to selected current epoch");
+            const emptyEpoch = await tool.execute("notify-empty-epoch", { action: "notify", to: "mention-peer-full-id", targetEpoch: "", message: "must not send" }, signal, undefined, harness!.ctx);
+            assert.equal(emptyEpoch.details?.error, true);
+            activeOwner = { version: 2 };
+            harness!.pi.events.emit(MENTION_READY_EVENT, { version: 2 });
+            assert.equal(unregistrations, 1);
+            assert.ok(warnings.some((message) => message.includes("Unsupported CLIM mention owner")));
+            assert.deepEqual((await harness!.emitLifecycleResults("input", { source: "interactive", text: input }))[0], { action: "continue" }, "an incompatible owner cannot restart legacy input");
+            activeOwner = { version: 1, registerProvider() { throw new Error("registration refused"); } };
+            harness!.pi.events.emit(MENTION_READY_EVENT, { version: 1 });
+            assert.ok(warnings.some((message) => message.includes("registration refused")));
+            assert.equal((await harness!.emitLifecycleResults("context", { messages: [original] }))[0], undefined);
+            activeOwner = owner;
+            harness!.pi.events.emit(MENTION_READY_EVENT, { version: 1 });
+            assert.equal(registrations, 2);
+            await harness!.emitLifecycle("session_shutdown");
+            assert.equal(unregistrations, 2);
+            harness!.pi.events.emit(MENTION_READY_EVENT, { version: 1 });
+            assert.equal(registrations, 2, "shutdown removes the ready listener");
           });
         });
       } finally {
@@ -1409,6 +1472,33 @@ test("workspace mentions select recipients, request AI composition and deliver i
   } finally {
     rmSync(fixtureDir, { recursive: true, force: true });
   }
+});
+
+test("CLIM mention owners present before session start prevent legacy registration", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const { default: extension } = await import("./index.ts");
+  const { MENTION_OWNER_EVENT } = await import("./session-mentions.ts");
+  let registrations = 0;
+  let unregistrations = 0;
+  let menus = 0;
+  const harness = createExtensionHarness("owned-before-start", { hasUI: true, sessionId: "owned-before-start-id", ui: {
+    addAutocompleteProvider: () => { menus++; },
+    setStatus: () => undefined,
+    notify: () => undefined,
+  } });
+  const owner = { version: 1, registerProvider() { registrations++; return () => { unregistrations++; }; } };
+  harness.pi.events.on(MENTION_OWNER_EVENT, (payload) => (payload as { reply: (owner: unknown) => void }).reply(owner));
+  try {
+    extension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    assert.equal(registrations, 1);
+    assert.equal(menus, 0);
+    assert.deepEqual((await harness.emitLifecycleResults("input", { source: "interactive", text: "@not-selected[12345678]" }))[0], { action: "continue" });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+  assert.equal(unregistrations, 1);
 });
 
 test("pinned notification endpoints never queue offline mail or switch to a reconnected process", { concurrency: false }, async () => {

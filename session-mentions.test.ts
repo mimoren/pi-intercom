@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Editor, CombinedAutocompleteProvider, type AutocompleteProvider } from "@earendil-works/pi-tui";
-import { createSessionMentionProvider, extractSessionMentions, notificationPrompt, resolveSessionMentions, sessionMentionToken, workspaceMentionPeers } from "./session-mentions.ts";
+import { createSessionMentionProvider, extractSessionMentions, notificationContext, notificationPrompt, resolveSessionMentionBinding, resolveSessionMentions, sessionMentionBinding, sessionMentionToken, workspaceMentionPeers, type SessionMentionBinding } from "./session-mentions.ts";
 import type { SessionInfo } from "./types.ts";
 
 function session(id: string, name: string, workspace = "workspace-a", tab = "tab-a"): SessionInfo {
   return {
-    id, name, cwd: `/projects/${name}`, model: "test-model", pid: process.pid, startedAt: 0, lastActivity: 0,
+    id, name, endpointEpoch: `epoch-${id}`, cwd: `/projects/${name}`, model: "test-model", pid: process.pid, startedAt: 0, lastActivity: 0,
     herdrLocation: { status: "current", workspace: { id: workspace, label: workspace }, tab: { id: tab, label: tab }, paneId: `pane-${id}`, refreshedAt: 0 },
   };
 }
@@ -26,7 +26,7 @@ test("mention tokens distinguish colliding short IDs and keep the selected full 
   const peers = [frontend, reviewer];
   const token = sessionMentionToken(frontend, peers);
   assert.equal(token, "@前端_开发[12345678-f]");
-  const selected = new Map([[token, frontend.id]]);
+  const selected = new Map([[token, sessionMentionBinding(frontend)]]);
   const mentions = extractSessionMentions(`Notify ${token}, and ${token} again.`);
   assert.equal(mentions.length, 2);
   assert.deepEqual(resolveSessionMentions(mentions, peers, selected), [frontend]);
@@ -51,7 +51,7 @@ test("@ completion filters sessions and delegates file paths without inventing c
     applyCompletion: new CombinedAutocompleteProvider([], process.cwd()).applyCompletion,
   };
   let status: string | undefined;
-  const selections = new Map<string, string>();
+  const selections = new Map<string, SessionMentionBinding>();
   const provider = createSessionMentionProvider(base, async () => [frontend, reviewer], (message) => { status = message; }, (token, id) => selections.set(token, id));
   const options = { signal: new AbortController().signal };
   const results = await provider.getSuggestions(["通知 @前端"], 0, 6, options);
@@ -59,7 +59,7 @@ test("@ completion filters sessions and delegates file paths without inventing c
   const item = results!.items[0]!;
   assert.match(item.description!, /projects.*tab-b/);
   provider.applyCompletion(["通知 @前端"], 0, 6, item, results!.prefix);
-  assert.equal(selections.get(item.value), frontend.id);
+  assert.equal(selections.get(item.value)?.sessionId, frontend.id);
   for (const input of ["@./READ", "@/tmp/", "@~/", '@"some path', "@C:\\work\\file", "mail@host"]) {
     await provider.getSuggestions([input], 0, input.length, options);
   }
@@ -78,7 +78,7 @@ test("native editor opens @ suggestions; selecting a recipient does not submit",
     borderColor: identity,
     selectList: { selectedPrefix: identity, selectedText: identity, description: identity, scrollInfo: identity, noMatch: identity },
   });
-  const selected = new Map<string, string>();
+  const selected = new Map<string, SessionMentionBinding>();
   editor.setAutocompleteProvider(createSessionMentionProvider(
     new CombinedAutocompleteProvider([], process.cwd()), async () => [frontend], () => undefined, (token, id) => selected.set(token, id),
   ));
@@ -105,6 +105,39 @@ test("aborted autocomplete does not publish stale workspace suggestions or statu
   const provider = createSessionMentionProvider(new CombinedAutocompleteProvider([], process.cwd()), async () => [frontend], () => { statusCalls++; }, () => undefined);
   assert.equal(await provider.getSuggestions(["@"], 0, 1, { signal: controller.signal }), null);
   assert.equal(statusCalls, 0);
+});
+
+test("selected endpoint bindings remain immutable and reject reconnects", () => {
+  const binding = sessionMentionBinding(frontend);
+  assert.equal(Reflect.set(binding, "endpointEpoch", "replacement"), false);
+  assert.equal(binding.endpointEpoch, frontend.endpointEpoch);
+  assert.equal(resolveSessionMentionBinding(binding, [frontend]), frontend);
+  assert.throws(() => resolveSessionMentionBinding(binding, [{ ...frontend, endpointEpoch: "replacement" }]), /endpoint changed/);
+  assert.throws(() => resolveSessionMentionBinding({ sessionId: frontend.id }, [frontend]), /Select the recipient again/);
+  assert.throws(() => sessionMentionBinding({ ...frontend, endpointEpoch: undefined }), /exact endpoint/);
+  const appendix = notificationContext([frontend]);
+  assert.ok(appendix.includes('"targetEpoch":"epoch-12345678-frontend"'));
+  assert.match(appendix, /Keep the selected targetEpoch/);
+});
+
+test("legacy autocomplete delegates after CLIM ownership including an in-flight query", async () => {
+  let enabled = true;
+  let finish: (peers: SessionInfo[]) => void = () => assert.fail("getPeers was not called");
+  let selected = false;
+  let delegated = 0;
+  const base: AutocompleteProvider = {
+    async getSuggestions() { delegated++; return { prefix: "base", items: [] }; },
+    applyCompletion: new CombinedAutocompleteProvider([], process.cwd()).applyCompletion,
+  };
+  const provider = createSessionMentionProvider(base, () => new Promise((resolve) => { finish = resolve; }), () => assert.fail("disabled legacy provider must not publish status"), () => { selected = true; }, () => enabled);
+  const pending = provider.getSuggestions(["@"], 0, 1, { signal: new AbortController().signal });
+  enabled = false;
+  finish([frontend]);
+  assert.equal((await pending)?.prefix, "base");
+  assert.equal((await provider.getSuggestions(["@"], 0, 1, { signal: new AbortController().signal }))?.prefix, "base");
+  provider.applyCompletion(["@"], 0, 1, { value: sessionMentionToken(frontend, [frontend]), label: "stale" }, "@");
+  assert.equal(selected, false);
+  assert.equal(delegated, 2);
 });
 
 test("notification input asks the current AI to compose contextual new messages to exact IDs", () => {
