@@ -159,7 +159,7 @@ export type ClientMessage =
   | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string }
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
-  | { type: "list"; requestId: string }
+  | { type: "list"; requestId: string; locationScope?: "workspace" }
   | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }

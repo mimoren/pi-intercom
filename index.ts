@@ -10,7 +10,7 @@ import { HandoverPicker, type HandoverPickerResult, type RemoteSessionLister } f
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, getIntercomScopeId, loadConfig, setIntercomScopeId, type IntercomConfig } from "./config.ts";
-import { EXTENSION_BUS_FEATURE } from "./types.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
@@ -40,6 +40,7 @@ import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
 import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import { formatHandoverMessage, generateHandoverBody, readGitState } from "./handover.ts";
 import { isIdleWakePending, releaseIdleWake, reserveIdleWake } from "./idle-wake.ts";
+import { createSessionMentionProvider, extractSessionMentions, notificationPrompt, resolveSessionMentions, workspaceMentionPeers } from "./session-mentions.ts";
 
 const INTERCOM_TOOL_NAME = "intercom";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
@@ -93,6 +94,8 @@ interface DeliveryRequest {
   retryOf?: string;
   /** Handovers are always new messages and are not sent once the signal aborts. */
   handover?: boolean;
+  /** Explicit workspace notifications never infer a reply target. */
+  notification?: boolean;
   noWake?: boolean;
 }
 
@@ -728,6 +731,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let disposed = true;
   let runtimeStarted = false;
   let runtimeGeneration = 0;
+  const selectedMentions = new Map<string, string>();
+  const pendingMentionPrompts: Array<{ text: string; prompt: string; createdAt: number }> = [];
+  const mentionPrompts = new Map<string, string>();
+  let mentionCache: { generation: number; client: IntercomClient; expiresAt: number; promise: Promise<SessionInfo[]> } | null = null;
   let agentRunning = false;
   const heldInboundMessages: InboundMessageEntry[] = [];
   let heldInboundTimer: NodeJS.Timeout | null = null;
@@ -1682,6 +1689,27 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
+  async function listMentionPeers(cached = false): Promise<SessionInfo[]> {
+    const generation = runtimeGeneration;
+    const ctx = getLiveContext();
+    if (!ctx) throw new Error("Intercom session is no longer active.");
+    const activeClient = await ensureConnected("overlay");
+    if (cached && mentionCache?.generation === generation && mentionCache.client === activeClient && mentionCache.expiresAt > Date.now()) {
+      return mentionCache.promise;
+    }
+    const promise = activeClient.listSessions({ locationScope: "workspace" }).then((sessions) => {
+      if (!getLiveContext(ctx, generation) || client !== activeClient) throw new Error("Intercom session changed. Select the recipient again.");
+      return workspaceMentionPeers(sessions, activeClient.sessionId!);
+    });
+    if (cached) {
+      mentionCache = { generation, client: activeClient, expiresAt: Infinity, promise };
+      void promise.then(
+        () => { if (mentionCache?.promise === promise) mentionCache.expiresAt = Date.now() + 1000; },
+        () => { if (mentionCache?.promise === promise) mentionCache = null; },
+      );
+    }
+    return promise;
+  }
   async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
     const sessions = await activeClient.listSessions();
     const byId = sessions.find(s => s.id === nameOrId);
@@ -1860,6 +1888,15 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   ): Promise<IntercomToolResult> {
     const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, noWake } = request;
     try {
+      let notificationTarget: SessionInfo | undefined;
+      if (request.notification) {
+        if (signal?.aborted) throw new Error("Notification cancelled before delivery.");
+        notificationTarget = (await listMentionPeers()).find((session) => session.id === to);
+        if (!notificationTarget) throw new Error("Notification recipient is no longer connected in this workspace. Select the recipient again.");
+        if (!notificationTarget.endpointEpoch || !connectedClient.supportsFeature(EXACT_SEND_FEATURE)) {
+          throw new Error("The broker must support exact endpoint delivery for notifications. Upgrade the broker and try again.");
+        }
+      }
       const crossMachineTarget = Boolean(to?.includes("@"));
       const crossMachineRestriction = explicitCrossMachineSendRestriction({
         to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf, noWake,
@@ -1940,18 +1977,20 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         }
       }
-      const target: DeliveryTarget = cwd
+      const target: DeliveryTarget = notificationTarget
+        ? { id: notificationTarget.id, label: notificationTarget.name || notificationTarget.id }
+        : cwd
         ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal })
         : { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
       const sendTo = target.id;
-      const targetDisplay = target.projectPane ? target.label : to ?? target.label;
+      const targetDisplay = notificationTarget?.name ?? (target.projectPane ? target.label : to ?? target.label);
       if (sendTo === connectedClient.sessionId) {
         return {
           content: [{ type: "text", text: "Cannot message the current session" }],
           details: { error: true },
         };
       }
-      const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
+      const activeReplyMismatch = replyTo || request.notification ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
       if (activeReplyMismatch) {
         const senderLabel = activeReplyMismatch.from.name || activeReplyMismatch.from.id;
         return {
@@ -1959,7 +1998,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           details: { error: true, replyTo: activeReplyMismatch.message.id },
         };
       }
-      const inferredAsk = replyTo || request.handover ? null : replyTracker.findUniquePendingAskFrom(sendTo);
+      const inferredAsk = replyTo || request.handover || request.notification ? null : replyTracker.findUniquePendingAskFrom(sendTo);
       const effectiveReplyTo = replyTo ?? inferredAsk?.message.id;
       if (confirmSend && !(cwd && openProjectPaneIfMissing)) {
         const confirmed = await ctx.ui.confirm(
@@ -1973,11 +2012,15 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         }
       }
-      if (request.handover && signal?.aborted) {
-        return { content: [{ type: "text", text: "Handover was cancelled before delivery." }], details: { error: true } };
+      if (request.notification && confirmSend && !(await listMentionPeers()).some((session) => session.id === sendTo)) {
+        throw new Error("Notification recipient left this workspace while confirmation was open. Select the recipient again.");
+      }
+      if ((request.handover || request.notification) && signal?.aborted) {
+        return { content: [{ type: "text", text: request.notification ? "Notification was cancelled before delivery." : "Handover was cancelled before delivery." }], details: { error: true } };
       }
       const { result, display, resolution, noMatchText } = await sendWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, (attemptTo) => connectedClient.send(attemptTo, {
         text: message,
+        targetEpoch: notificationTarget?.endpointEpoch,
         attachments,
         replyTo: effectiveReplyTo,
         supersedes,
@@ -2088,6 +2131,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     disposed = false;
     runtimeStarted = true;
     runtimeGeneration += 1;
+    selectedMentions.clear();
+    pendingMentionPrompts.length = 0;
+    mentionPrompts.clear();
+    mentionCache = null;
     outboxRequestIds.clear();
     reconnectAttempt = 0;
     sessionHeldBlocked = false;
@@ -2237,6 +2284,60 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       return;
     }
     startSessionRuntime(ctx);
+    if (ctx.mode === "tui" && typeof ctx.ui?.addAutocompleteProvider === "function") {
+      ctx.ui.addAutocompleteProvider((current) => createSessionMentionProvider(
+        current,
+        () => listMentionPeers(true),
+        (message) => { if (getLiveContext()) ctx.ui.setStatus("intercom-mentions", message); },
+        (token, sessionId) => { selectedMentions.set(token, sessionId); },
+      ));
+    } else if (ctx.mode === "tui") {
+      ctx.ui?.notify?.("Session @ mentions require Pi's extension autocomplete support. Update Pi to use the @ menu; /intercom remains available.", "warning");
+    }
+  });
+  pi.on("input", async (event, ctx) => {
+    if (!config.enabled || ctx.mode !== "tui" || event.source !== "interactive") return { action: "continue" };
+    const generation = runtimeGeneration;
+    try {
+      const mentions = extractSessionMentions(event.text);
+      if (mentions.length === 0) return { action: "continue" };
+      const targets = resolveSessionMentions(mentions, await listMentionPeers(), selectedMentions);
+      pendingMentionPrompts.push({ text: event.text, prompt: notificationPrompt(event.text, targets), createdAt: Date.now() });
+      return { action: "continue" };
+    } catch (error) {
+      if (getLiveContext(ctx, generation)) {
+        const reason = getErrorMessage(error);
+        pi.appendEntry("intercom_notification_draft", { text: event.text, reason, timestamp: Date.now() });
+        ctx.ui.notify(reason, "warning");
+        if (!ctx.ui.getEditorText()) ctx.ui.setEditorText(event.text);
+      }
+      return { action: "handled" };
+    }
+  });
+  pi.on("context", (event) => {
+    if (pendingMentionPrompts.length === 0 && mentionPrompts.size === 0) return;
+    // Only the provider-bound copy is expanded; the editor and session history keep the user's text.
+    const messages = [...event.messages];
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]!;
+      if (message.role !== "user") continue;
+      const content = typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content;
+      const text = content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+      const key = JSON.stringify([message.timestamp, text]);
+      let prompt = mentionPrompts.get(key);
+      if (!prompt) {
+        let pendingIndex = pendingMentionPrompts.length - 1;
+        while (pendingIndex >= 0 && (
+          pendingMentionPrompts[pendingIndex]!.text !== text
+          || pendingMentionPrompts[pendingIndex]!.createdAt > message.timestamp
+        )) pendingIndex--;
+        if (pendingIndex < 0) continue;
+        prompt = pendingMentionPrompts.splice(pendingIndex, 1)[0]!.prompt;
+        mentionPrompts.set(key, prompt);
+      }
+      messages[index] = { ...message, content: [{ type: "text", text: prompt }, ...content.filter((part) => part.type !== "text")] };
+    }
+    return { messages };
   });
   
   pi.on("session_shutdown", async () => {
@@ -2248,6 +2349,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     disposed = true;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session shutting down");
     runtimeGeneration += 1;
+    selectedMentions.clear();
+    pendingMentionPrompts.length = 0;
+    mentionPrompts.clear();
+    mentionCache = null;
     clearStartupConnectTimer();
     clearReconnectTimer();
     clearNamePollTimer();
@@ -2641,6 +2746,7 @@ Usage:
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
   intercom({ action: "send", to: "name-or-id", message: "...", noWake: true }) → Information only: an idle receiver reads it on its next turn instead of starting one
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
+  intercom({ action: "notify", to: "exact-session-id", message: "contextual notification" }) → Send a new workspace notification without replying to a pending ask
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
   intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
@@ -2652,14 +2758,14 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
+      action: StringEnum(["list", "list-cwd", "send", "notify", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'notify', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'notify' sends an AI-composed new message to an exact session ID in the current workspace, without inferring a reply. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
       }),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). 'notify' requires an exact session ID in the current workspace. For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
       message: Type.Optional(Type.String({
-        description: "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
+        description: "Message to send (for 'send', 'notify', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
         type: StringEnum(["file", "snippet", "context"] as const),
@@ -2823,6 +2929,12 @@ Usage:
           }
         }
 
+        case "notify": {
+          if (!to || !message?.trim() || cwd || openProjectPaneIfMissing || replyTo || supersedes || retryOf || attachments?.length || noWake) {
+            return { content: [{ type: "text", text: "notify requires an exact workspace session ID and a composed message; routing, reply, attachment and noWake options are not supported." }], details: { error: true } };
+          }
+          return deliverMessage(connectedClient, ctx, _signal, { to, message, notification: true });
+        }
         case "send": {
           if ((!to && !cwd) || !message) {
             return {

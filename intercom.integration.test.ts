@@ -243,7 +243,10 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     cwd: repoDir,
     mode: options.mode ?? (options.hasUI ? "tui" : "print"),
     model: { id: "child-model" },
-    sessionManager: { getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test" },
+    sessionManager: {
+      getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test",
+      getSessionFile: () => undefined,
+    },
     isIdle: options.isIdle ?? (() => true),
     hasUI: options.hasUI ?? false,
     abort: options.abort ?? (() => undefined),
@@ -1272,6 +1275,165 @@ console.log(JSON.stringify({ result: { snapshot: {
     await worker.disconnect().catch(() => undefined);
     await setup.cleanup();
     rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("workspace mentions select recipients, request AI composition and deliver independent notifications", { concurrency: false }, async () => {
+  const { CombinedAutocompleteProvider } = await import("@earendil-works/pi-tui");
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-mentions-"));
+  const fixtureBin = path.join(fixtureDir, "herdr-fixture");
+  const snapshotPath = path.join(fixtureDir, "snapshot.json");
+  const snapshot = {
+    panes: [
+      { pane_id: "mention-self", tab_id: "tab-a", workspace_id: "workspace-a" },
+      { pane_id: "mention-peer", tab_id: "tab-b", workspace_id: "workspace-a" },
+      { pane_id: "mention-outside", tab_id: "tab-outside", workspace_id: "workspace-outside" },
+    ],
+    tabs: [
+      { tab_id: "tab-a", workspace_id: "workspace-a", label: "Current" },
+      { tab_id: "tab-b", workspace_id: "workspace-a", label: "Other project" },
+      { tab_id: "tab-outside", workspace_id: "workspace-outside", label: "Outside" },
+    ],
+    workspaces: [{ workspace_id: "workspace-a", label: "Current workspace" }, { workspace_id: "workspace-outside", label: "Other workspace" }],
+  };
+  writeFileSync(snapshotPath, JSON.stringify(snapshot));
+  writeFileSync(fixtureBin, `#!/usr/bin/env node\nconst fs = require("node:fs"); console.log(JSON.stringify({ result: { snapshot: JSON.parse(fs.readFileSync(${JSON.stringify(snapshotPath)}, "utf8")) } }));\n`);
+  chmodSync(fixtureBin, 0o755);
+  const peer = new IntercomClient();
+  const outside = new IntercomClient();
+  let harness: ReturnType<typeof createExtensionHarness> | undefined;
+  try {
+    await withEnv("HERDR_BIN", fixtureBin, async () => {
+      const setup = await setupClients();
+      try {
+        const registration = { name: "角色", cwd: `${repoDir}/another-project`, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() };
+        await peer.connect({ ...registration, herdrPaneId: "mention-peer" }, "mention-peer-full-id");
+        await outside.connect({ ...registration, herdrPaneId: "mention-outside" }, "mention-outside-full-id");
+        const received: Message[] = [];
+        peer.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+        let wrap: ((base: import("@earendil-works/pi-tui").AutocompleteProvider) => import("@earendil-works/pi-tui").AutocompleteProvider) | undefined;
+        let editorText = "";
+        let moveOnConfirm = false;
+        const warnings: string[] = [];
+        harness = createExtensionHarness("notification-author", {
+          hasUI: true, sessionId: "mention-author-full-id",
+          ui: {
+            addAutocompleteProvider: (factory: typeof wrap) => { wrap = factory; },
+            setStatus: () => undefined,
+            notify: (message: string) => warnings.push(message),
+            getEditorText: () => editorText,
+            setEditorText: (text: string) => { editorText = text; },
+            confirm: async () => {
+              if (moveOnConfirm) {
+                snapshot.panes[1]!.workspace_id = "workspace-outside";
+                snapshot.panes[1]!.tab_id = "tab-outside";
+                writeFileSync(snapshotPath, JSON.stringify(snapshot));
+              }
+              return true;
+            },
+          },
+        });
+        const extension = (await import("./index.ts")).default;
+        await withIntercomConfig({ confirmSend: true }, () => extension(harness!.pi as never));
+        await withEnv("HERDR_PANE_ID", "mention-self", async () => {
+          await harness!.emitLifecycle("session_start");
+          const tool = harness!.tools.find((item) => item.name === "intercom")!;
+          await waitForSessionId(setup.planner, "mention-author-full-id");
+          assert.ok(wrap, "session_start must register the native autocomplete provider");
+          // The @ menu must include sibling tabs even when ordinary list is filtered to this tab.
+          await withIntercomConfig({ listLocationScope: "tab" }, async () => {
+            const signal = new AbortController().signal;
+            const provider = wrap!(new CombinedAutocompleteProvider([], repoDir));
+            const options = { signal: new AbortController().signal };
+            const suggestions = await provider.getSuggestions(["@"], 0, 1, options);
+            assert.equal(suggestions?.items.length, 1);
+            const selected = suggestions!.items[0]!;
+            assert.match(selected.description!, /another-project.*Other project/);
+            const completed = provider.applyCompletion(["@"], 0, 1, selected, "@");
+            const input = `${completed.lines[0]}同步刚才确认的接口变更`;
+            const result = (await harness!.emitLifecycleResults("input", { source: "interactive", text: input, streamingBehavior: "steer" }))[0];
+            assert.deepEqual(result, { action: "continue" }, "the visible user prompt must remain unchanged");
+            const original = { role: "user", content: [{ type: "text", text: input }, { type: "image", mimeType: "image/png", data: "test-image" }], timestamp: Date.now() + 1 };
+            const historical = { role: "user", content: input, timestamp: 1 };
+            const context = (await harness!.emitLifecycleResults("context", { messages: [historical, original] }))[0] as { messages: Array<{ content: unknown }> };
+            assert.equal(context.messages[0], historical, "an older identical prompt must not consume the new request");
+            assert.match(JSON.stringify(context.messages[1]), /Use the current conversation/);
+            assert.ok(JSON.stringify(context.messages[1]).includes("mention-peer-full-id"));
+            assert.ok(JSON.stringify(context.messages[1]).includes("test-image"), "images are preserved");
+            assert.equal(original.content[0]!.text, input, "model-only instructions must not mutate session history");
+            const repeated = (await harness!.emitLifecycleResults("context", { messages: [historical, original] }))[0];
+            assert.deepEqual(repeated, context, "subsequent model calls retain the notification instructions");
+            assert.equal(received.length, 0, "selecting and submitting only instructs the AI; it must not send the raw input");
+            assert.equal(harness!.sentMessages.length, 0);
+            assert.deepEqual((await harness!.emitLifecycleResults("input", { source: "extension", text: input }))[0], { action: "continue" });
+            assert.deepEqual((await harness!.emitLifecycleResults("input", { source: "interactive", text: "read @./README.md" }))[0], { action: "continue" });
+            const ask = await peer.send("mention-author-full-id", { text: "An unrelated pending question", expectsReply: true });
+            await waitForCondition(() => harness!.sentMessages.length > 0, "pending peer ask");
+            await harness!.emitLifecycle("turn_start");
+            const notification = await tool.execute("notify-composed", { action: "notify", to: "mention-peer-full-id", message: "接口已确认使用 cursor 分页，请据此调整前端。" }, signal, undefined, harness!.ctx);
+            assert.equal(notification.details?.delivered, true);
+            await waitForCondition(() => received.length === 1, "composed notification");
+            assert.equal(received[0]!.content.text, "接口已确认使用 cursor 分页，请据此调整前端。");
+            assert.equal(received[0]!.replyTo, undefined, "notifications must never answer an unrelated pending ask");
+            const pending = await tool.execute("pending-after-notify", { action: "pending" }, signal, undefined, harness!.ctx);
+            assert.ok(JSON.stringify(pending).includes(ask.id), "the pending ask remains open");
+            const forbidden = await tool.execute("notify-outside", { action: "notify", to: "mention-outside-full-id", message: "do not deliver" }, signal, undefined, harness!.ctx);
+            assert.equal(forbidden.details?.error, true);
+            const aborted = new AbortController(); aborted.abort();
+            const cancelled = await tool.execute("notify-aborted", { action: "notify", to: "mention-peer-full-id", message: "do not deliver" }, aborted.signal, undefined, harness!.ctx);
+            assert.equal(cancelled.details?.error, true);
+            moveOnConfirm = true;
+            const moved = await tool.execute("notify-moved-during-confirm", { action: "notify", to: "mention-peer-full-id", message: "do not deliver" }, signal, undefined, harness!.ctx);
+            assert.equal(moved.details?.error, true);
+            assert.match(moved.content[0]!.text, /left this workspace while confirmation was open/);
+            const staleInput = (await harness!.emitLifecycleResults("input", { source: "interactive", text: input }))[0];
+            assert.deepEqual(staleInput, { action: "handled" });
+            assert.equal(editorText, input, "failed validation restores the submitted draft");
+            assert.ok(warnings.some((message) => message.includes("Select the recipient again")));
+            editorText = "A newer draft being edited";
+            await harness!.emitLifecycle("input", { source: "interactive", text: input });
+            assert.equal(editorText, "A newer draft being edited", "a failed submission must not overwrite a newer draft");
+            assert.ok(harness!.entries.some((entry) => entry.type === "intercom_notification_draft" && (entry.data as { text: string }).text === input), "the unsent draft is saved for recovery");
+            assert.equal(received.length, 1);
+            // Unknown workspace identity must not fall back to the machine-wide roster.
+            assert.deepEqual(await setup.planner.listSessions({ locationScope: "workspace" }), []);
+          });
+        });
+      } finally {
+        await harness?.emitLifecycle("session_shutdown");
+        await peer.disconnect().catch(() => undefined);
+        await outside.disconnect().catch(() => undefined);
+        await setup.cleanup();
+      }
+    });
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("pinned notification endpoints never queue offline mail or switch to a reconnected process", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  try {
+    const id = orchestrator.sessionId!;
+    const original = (await planner.listSessions()).find((session) => session.id === id)!;
+    await orchestrator.disconnect();
+    await waitForNoSessionId(planner, id);
+    const offline = await planner.send(id, { text: "must not queue", targetEpoch: original.endpointEpoch! });
+    assert.equal(offline.delivered, false);
+    assert.equal(offline.code, "E_TARGET_NOT_FOUND");
+    const received: Message[] = [];
+    orchestrator.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+    await orchestrator.connect({ name: "orchestrator", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, id);
+    const replacement = await waitForSessionId(planner, id);
+    assert.notEqual(replacement.endpointEpoch, original.endpointEpoch);
+    const rebound = await planner.send(id, { text: "must not switch endpoints", targetEpoch: original.endpointEpoch! });
+    assert.equal(rebound.delivered, false);
+    assert.equal(rebound.code, "E_TARGET_REBOUND");
+    // A list round trip after both sends makes any erroneously queued mail observable.
+    await orchestrator.listSessions();
+    assert.equal(received.length, 0);
+  } finally {
+    await cleanup();
   }
 });
 

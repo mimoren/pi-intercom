@@ -27,6 +27,8 @@ interface SendOptions {
   expectsReply?: boolean;
   noWake?: boolean;
   messageId?: string;
+  /** Pin a previously validated live endpoint; never fall back to offline mail or a rebound endpoint. */
+  targetEpoch?: string;
   supersedes?: string;
   retryOf?: string;
   provenance?: MessageProvenance;
@@ -601,7 +603,7 @@ export class IntercomClient extends EventEmitter {
     writeMessage(socket, { type: "extension_capabilities_update", extensions: extensions ?? [] });
   }
 
-  listSessions(options: { timeoutMs?: number } = {}): Promise<SessionInfo[]> {
+  listSessions(options: { timeoutMs?: number; locationScope?: "workspace" } = {}): Promise<SessionInfo[]> {
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
@@ -627,7 +629,7 @@ export class IntercomClient extends EventEmitter {
       }, options.timeoutMs ?? 5000);
       this.pendingLists.set(requestId, { resolve: wrappedResolve, reject: wrappedReject });
       try {
-        writeMessage(socket, { type: "list", requestId });
+        writeMessage(socket, { type: "list", requestId, ...(options.locationScope ? { locationScope: options.locationScope } : {}) });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingLists.delete(requestId);
@@ -688,6 +690,10 @@ export class IntercomClient extends EventEmitter {
       }
     });
 
+    if (options.targetEpoch) {
+      if (!this.supportsFeature(EXACT_SEND_FEATURE)) throw new Error("Broker does not support pinned endpoint delivery. Upgrade the broker before sending notifications.");
+      return sendOnce(to, options.targetEpoch);
+    }
     if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) {
       return sendOnce();
     }
