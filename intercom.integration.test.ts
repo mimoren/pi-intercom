@@ -5903,12 +5903,13 @@ async function registeredIntercomRenderer() {
   return { harness, renderer };
 }
 
-test("registered inline renderer retains local choice across child rebuild and resize without mutating frozen details", async () => {
+test("registered inline renderer keeps the full body across rebuilds, clicks and resize without mutating frozen details", async () => {
   const { renderer, harness } = await registeredIntercomRenderer();
   const message = rendererMessage();
   const snapshot = structuredClone(message);
   const child = renderer(message, { expanded: false, outputPad: 1 }, renderTheme as never)!;
   assert.ok(child instanceof InlineMessageComponent);
+  assert.equal(rendererExpanded(child), true, "global collapsed state still shows the complete message");
   rendererClick(child, 1);
   const rebuilt = renderer(message, { expanded: false, outputPad: 1 }, renderTheme as never)!;
   assert.equal(rendererExpanded(rebuilt), true, "same outer message retains local expansion after callback rebuild");
@@ -5920,23 +5921,16 @@ test("registered inline renderer retains local choice across child rebuild and r
   assert.deepEqual(harness.sentMessages, []);
 });
 
-test("registered inline renderer resets local choice permanently on rapid global false true false callbacks", async () => {
+test("registered inline renderer stays expanded through rapid global false true false callbacks", async () => {
   const { renderer } = await registeredIntercomRenderer();
   const message = rendererMessage();
-  const child = renderer(message, { expanded: false, outputPad: 1 }, renderTheme as never)!;
-  rendererClick(child);
-  // Deliberately do not render either callback result between the global changes.
-  renderer(message, { expanded: true, outputPad: 1 }, renderTheme as never);
-  const collapsed = renderer(message, { expanded: false, outputPad: 1 }, renderTheme as never)!;
-  assert.equal(rendererExpanded(collapsed), false, "final global false clears the old local expansion");
-  rendererClick(collapsed);
-  assert.equal(rendererExpanded(renderer(message, { expanded: false, outputPad: 1 }, renderTheme as never)!), true, "new local choice survives rebuild after the reset");
-  renderer(message, { expanded: true, outputPad: 1 }, renderTheme as never);
-  const expanded = renderer(message, { expanded: true, outputPad: 1 }, renderTheme as never)!;
-  rendererClick(expanded);
-  assert.equal(rendererExpanded(renderer(message, { expanded: true, outputPad: 1 }, renderTheme as never)!), false, "local collapse is independent of global true");
-  renderer(message, { expanded: false, outputPad: 1 }, renderTheme as never);
-  assert.equal(rendererExpanded(renderer(message, { expanded: true, outputPad: 1 }, renderTheme as never)!), true, "global round trip also clears local collapse");
+  for (const expanded of [false, true, false, true, true, false]) {
+    const child = renderer(message, { expanded, outputPad: 1 }, renderTheme as never)!;
+    assert.equal(rendererExpanded(child), true);
+    rendererClick(child);
+    assert.equal(rendererExpanded(child), true, "click cannot hide incoming text");
+    assert.equal(rendererExpanded(renderer(message, { expanded, outputPad: 1 }, renderTheme as never)!), true);
+  }
 });
 
 test("registered inline renderer isolates outer messages with duplicate or missing envelope ids and factory runtimes", async () => {
@@ -5948,10 +5942,10 @@ test("registered inline renderer isolates outer messages with duplicate or missi
     const childA = renderer(a, { expanded: false, outputPad: 1 }, renderTheme as never)!;
     const childB = renderer(b, { expanded: false, outputPad: 1 }, renderTheme as never)!;
     rendererClick(childA, 2);
-    assert.equal(rendererExpanded(childA), true, `${id}: A expands`);
-    assert.equal(rendererExpanded(childB), false, `${id}: B stays collapsed`);
-    assert.equal(rendererExpanded(renderer(b, { expanded: false, outputPad: 1 }, renderTheme as never)!), false);
-    assert.equal(rendererExpanded(otherRuntime.renderer(a, { expanded: false, outputPad: 1 }, renderTheme as never)!), false, "another factory does not inherit A's choice");
+    assert.equal(rendererExpanded(childA), true, `${id}: A stays expanded`);
+    assert.equal(rendererExpanded(childB), true, `${id}: B stays expanded`);
+    assert.equal(rendererExpanded(renderer(b, { expanded: false, outputPad: 1 }, renderTheme as never)!), true);
+    assert.equal(rendererExpanded(otherRuntime.renderer(a, { expanded: false, outputPad: 1 }, renderTheme as never)!), true, "another factory also shows complete messages");
     assert.equal(rendererExpanded(renderer(a, { expanded: false, outputPad: 1 }, renderTheme as never)!), true);
   }
   assert.equal(rendererExpanded(renderer(rendererMessage(), { expanded: true, outputPad: 1 }, renderTheme as never)!), true, "new outer message starts with current global value");
@@ -5995,12 +5989,12 @@ test("registered inline renderer follows real CustomMessageComponent rebuild and
     assert.equal(rendererExpanded(host), true, "resize preserves choice");
     host.setExpanded(true);
     host.setExpanded(false);
-    assert.equal(rendererExpanded(host), false, "two global updates without a frame discard old choice");
+    assert.equal(rendererExpanded(host), true, "global updates cannot hide incoming text");
     host.invalidate();
-    assert.equal(rendererExpanded(host), false, "discarded local expansion cannot resurrect");
+    assert.equal(rendererExpanded(host), true, "invalidation keeps the full body");
     assert.deepEqual(message, snapshot);
     const reconstructed = new CustomMessageComponent(structuredClone(message), capture);
-    assert.equal(rendererExpanded(reconstructed), false, "full reconstruction defaults to host global state");
+    assert.equal(rendererExpanded(reconstructed), true, "full reconstruction still shows the complete message");
   } finally {
     keys.forEach((key, index) => {
       const descriptor = previous[index];

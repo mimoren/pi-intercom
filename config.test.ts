@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getConfigPath, loadConfig } from "./config.ts";
+import { getConfigPath, getListLocationScope, loadConfig } from "./config.ts";
 
 async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -19,6 +19,44 @@ async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Prom
 test("getConfigPath uses the centralized intercom runtime directory", () => {
   assert.equal(getConfigPath("/tmp/pi-agent/intercom"), join("/tmp/pi-agent", "intercom", "config.json"));
 });
+
+test("roster location scope defaults to machine", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().listLocationScope, "machine");
+      assert.equal(getListLocationScope(), "machine");
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const scope of ["machine", "workspace", "tab"]) {
+  test(`roster location scope accepts ${scope}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+    try {
+      mkdirSync(join(root, "intercom"), { recursive: true });
+      writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ listLocationScope: scope }));
+      await withAgentDir(root, () => assert.equal(getListLocationScope(), scope));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const value of ["project", "", null, true, 1, {}, []]) {
+  test(`roster location scope rejects ${JSON.stringify(value)}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+    try {
+      mkdirSync(join(root, "intercom"), { recursive: true });
+      writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ listLocationScope: value }));
+      await withAgentDir(root, () => assert.throws(() => getListLocationScope(), /"listLocationScope" must be/));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("loadConfig reads config below PI_CODING_AGENT_DIR", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));

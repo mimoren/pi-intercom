@@ -33,6 +33,12 @@ export function setIntercomScopeId(scopeId: string | undefined): void {
 
 export type InboundTriggerPolicy = "always" | "replies" | "never";
 export type BusyDeliveryPolicy = "steer" | "human-first";
+export type ListLocationScope = "machine" | "workspace" | "tab";
+
+/** Roster view filter read from the machine-global intercom config. */
+export function getListLocationScope(): ListLocationScope {
+  return loadConfig().listLocationScope ?? "machine";
+}
 
 export interface CrossMachineConfig {
   /** Name peers use for this host in their Herdr saved-machine lists. */
@@ -62,6 +68,9 @@ export interface IntercomConfig {
 
   /** Optional stable intercom session ID for restart-stable addressing */
   stableId?: string;
+
+  /** Filter the roster by the viewer's live Herdr location; defaults to machine. */
+  listLocationScope?: ListLocationScope;
   
   /** Enable/disable intercom (default: true) */
   enabled: boolean;
@@ -78,6 +87,7 @@ export function getConfigPath(intercomDir: string = getIntercomDirPath()): strin
 }
 
 const defaults: IntercomConfig = {
+  listLocationScope: "machine",
   brokerCommand: "npx",
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
@@ -190,6 +200,17 @@ export function loadConfig(): IntercomConfig {
         throw new Error(`"stableId" must not be empty`);
       }
       config.stableId = stableId;
+    }
+
+    if (Object.hasOwn(parsedConfig, "listLocationScope")) {
+      if (
+        parsedConfig.listLocationScope !== "machine"
+        && parsedConfig.listLocationScope !== "workspace"
+        && parsedConfig.listLocationScope !== "tab"
+      ) {
+        throw new Error(`"listLocationScope" must be "machine", "workspace", or "tab"`);
+      }
+      config.listLocationScope = parsedConfig.listLocationScope;
     }
 
     if (Object.hasOwn(parsedConfig, "crossMachine")) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -87,6 +87,64 @@ async function stopBroker(broker: ChildProcessWithoutNullStreams): Promise<void>
   broker.kill("SIGTERM");
   await once(broker, "exit");
 }
+
+test("roster filtering uses live location without blocking explicit delivery", { concurrency: false, timeout: 15_000 }, async () => {
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-roster-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousHerdrBin = process.env.HERDR_BIN;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const snapshotPath = path.join(agentDir, "snapshot.json");
+  const herdrBin = path.join(agentDir, "herdr.cjs");
+  const panes = [
+    { pane_id: "self", workspace_id: "w1", tab_id: "t1" },
+    { pane_id: "same-tab", workspace_id: "w1", tab_id: "t1" },
+    { pane_id: "other-tab", workspace_id: "w1", tab_id: "t2" },
+    { pane_id: "outside", workspace_id: "w2", tab_id: "t3" },
+  ];
+  const snapshot = {
+    panes,
+    tabs: [{ tab_id: "t1", workspace_id: "w1", label: "Main" }, { tab_id: "t2", workspace_id: "w1", label: "Other" }, { tab_id: "t3", workspace_id: "w2", label: "Remote" }],
+    workspaces: [{ workspace_id: "w1", label: "Project" }, { workspace_id: "w2", label: "Research" }],
+  };
+  writeFileSync(snapshotPath, JSON.stringify(snapshot));
+  writeFileSync(herdrBin, `#!${process.execPath}\nprocess.stdout.write(require("node:fs").readFileSync(${JSON.stringify(snapshotPath)}, "utf8"));\n`);
+  chmodSync(herdrBin, 0o755);
+  process.env.HERDR_BIN = herdrBin;
+  mkdirSync(path.join(agentDir, "intercom"), { recursive: true });
+  const configPath = path.join(agentDir, "intercom", "config.json");
+  const setScope = (scope: string) => writeFileSync(configPath, JSON.stringify({ listLocationScope: scope }));
+  setScope("machine");
+  let broker: ChildProcessWithoutNullStreams | undefined;
+  const clients: IntercomClient[] = [];
+  try {
+    broker = await startBroker(agentDir);
+    for (const id of ["self", "same-tab", "other-tab", "outside", "shell"]) {
+      const client = new IntercomClient();
+      clients.push(client);
+      await client.connect({ ...registration(id, Date.now()), ...(id === "shell" ? {} : { herdrPaneId: id }) }, id);
+    }
+    const ids = async () => (await clients[0]!.listSessions()).map(item => item.id).sort();
+    const all = ["other-tab", "outside", "same-tab", "self", "shell"];
+    assert.deepEqual(await ids(), all);
+    setScope("workspace");
+    assert.deepEqual(await ids(), ["other-tab", "same-tab", "self"]);
+    setScope("tab");
+    assert.deepEqual(await ids(), ["same-tab", "self"]);
+    assert.equal((await clients[0]!.send("outside", { text: "explicit synthetic delivery" })).delivered, true);
+    writeFileSync(snapshotPath, JSON.stringify({ ...snapshot, panes: panes.filter(item => item.pane_id !== "self") }));
+    assert.deepEqual(await ids(), all, "unresolved viewer fails open");
+    setScope("invalid");
+    assert.deepEqual(await ids(), all, "configuration errors retain the broker list fallback");
+  } finally {
+    await Promise.all(clients.map(client => client.disconnect()));
+    if (broker) await stopBroker(broker);
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousHerdrBin === undefined) delete process.env.HERDR_BIN;
+    else process.env.HERDR_BIN = previousHerdrBin;
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
 
 test("extension bus negotiates, routes, elects an owner, and persists state", { concurrency: false, timeout: 30_000 }, async () => {
   const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-extension-"));

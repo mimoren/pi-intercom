@@ -51,13 +51,10 @@ test("expanded inline intercom messages show the full body without collapse cont
   assert.doesNotMatch(rendered, /Ctrl\+O/);
 });
 
-test("a late reply shows which ask it answered, expanded and collapsed", () => {
+test("late replies retain the ask they answered", () => {
   const lateReply: Message = { ...message, lateReplyTo: "ask-abcdefgh-1234" };
-  const expanded = new InlineMessageComponent(from, lateReply, theme as any).render(100).join("\n");
-  const collapsed = new InlineMessageComponent(from, lateReply, theme as any, undefined, undefined, true).render(100).join("\n");
-
-  assert.match(expanded, /Late reply to ask-abcd/);
-  assert.match(collapsed, /Late reply to ask-abcd/);
+  const rendered = new InlineMessageComponent(from, lateReply, theme as any).render(100).join("\n");
+  assert.match(rendered, /Late reply to ask-abcd/);
 });
 
 test("cross-machine messages label the asserted identity as unverified", () => {
@@ -77,7 +74,7 @@ test("cross-machine messages label the asserted identity as unverified", () => {
   assert.doesNotMatch(rendered, /To reply/);
 });
 
-test("collapsed cross-machine messages keep the unverified identity and new-message affordance explicit", () => {
+test("cross-machine messages keep the unverified identity and new-message affordance explicit", () => {
   const component = new InlineMessageComponent(from, {
     ...message,
     crossMachine: {
@@ -86,7 +83,7 @@ test("collapsed cross-machine messages keep the unverified identity and new-mess
       origin: { name: "worker", sessionId: "00000000-0000-4000-8000-000000000001", machine: "laptop" },
       trust: "ssh-asserted",
     },
-  }, theme as any, 'intercom({ action: "send", to: "worker@laptop", message: "..." })', undefined, true);
+  }, theme as any, 'intercom({ action: "send", to: "worker@laptop", message: "..." })');
 
   const rendered = component.render(160).join("\n");
   assert.match(rendered, /From: worker@laptop · unverified cross-machine/);
@@ -103,32 +100,30 @@ test("local message header and reply affordance remain unchanged", () => {
   assert.doesNotMatch(rendered, /unverified cross-machine|To send a new message to/);
 });
 
-test("collapsed inline intercom messages keep preview, reply hint, and expand key visible", () => {
+test("inline intercom messages always show the complete body, reply hint and attachments", () => {
   const component = new InlineMessageComponent(
     from,
     {
       ...message,
       content: {
-        text: "Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu. This tail should only appear when expanded because the collapsed preview is intentionally brief.",
+        text: "Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu. The complete incoming message tail must always remain visible.",
         attachments: [{ type: "snippet", name: "note.txt", content: "important details" }],
       },
     },
     theme as any,
     "intercom({ action: \"reply\", message: \"...\" })",
-    undefined,
-    true,
   );
 
   const lines = component.render(120);
   const rendered = lines.join("\n");
 
-  assert.equal(lines.length, 4);
+  assert.ok(lines.length > 4);
   for (const line of lines) assert.equal(visibleWidth(line), 120);
   assert.match(rendered, /Alpha beta gamma/);
-  assert.doesNotMatch(rendered, /intentionally brief/);
+  assert.match(rendered.replace(/[│\n]/g, "").replace(/\s+/g, " "), /always remain visible/);
   assert.match(rendered, /To reply: intercom/);
-  assert.match(rendered, /Ctrl\+O/);
-  assert.match(rendered, /1 attachment/);
+  assert.doesNotMatch(rendered, /Ctrl\+O/);
+  assert.match(rendered, /Attachment: note\.txt/);
 });
 
 const roleCodes = {
@@ -180,9 +175,9 @@ test("inline message colors follow the tool-title, text, muted-border, and dim-m
   assert.ok(!calls.includes("accent"));
 });
 
-test("collapsed inline messages preserve the same hierarchy without accent", () => {
+test("inline messages preserve the same hierarchy without accent", () => {
   const calls: string[] = [];
-  const component = new InlineMessageComponent(from, message, styledTheme(calls) as any, "intercom reply", undefined, true);
+  const component = new InlineMessageComponent(from, message, styledTheme(calls) as any, "intercom reply");
 
   const rendered = component.render(72).join("\n");
 
@@ -254,23 +249,21 @@ function mouseEvent(component: Component, y: number, overrides: Partial<TuiMouse
   } satisfies TuiMouseEvent;
 }
 
-for (const collapsed of [true, false]) {
-  test(`inline click on any ${collapsed ? "collapsed" : "expanded"} row toggles only this message`, () => {
-    const rows = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply", undefined, collapsed).render(100).length;
-    for (let y = 0; y < rows; y++) {
-      const component: Component = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply", undefined, collapsed);
-      const neighbor = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply", undefined, collapsed);
-      const neighborBefore = neighbor.render(100);
-      const lines = component.render(100);
-      const result = component.handleMouse?.(mouseEvent(component, y));
-      assert.equal(component.render(100).join("\n").includes("EXPANDED_TAIL"), collapsed, `row ${y}: single click changes visible expansion`);
-      assert.deepEqual(result, { handled: true, render: true });
-      assert.deepEqual(neighbor.render(100), neighborBefore);
-      assert.deepEqual(component.handleMouse?.(mouseEvent(component, 0, { clickCount: undefined })), { handled: true, render: true });
-      assert.deepEqual(component.render(100), lines, `row ${y}: a second deliberate single restores output`);
+test("inline clicks never hide message content or metadata", () => {
+  const rows = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply").render(100).length;
+  for (let y = 0; y < rows; y++) {
+    const component: Component = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply");
+    const neighbor = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply");
+    const lines = component.render(100);
+    assert.equal(component.handleMouse?.(mouseEvent(component, y)), undefined);
+    assert.deepEqual(component.render(100), lines);
+    assert.deepEqual(neighbor.render(100), lines);
+    const rendered = lines.join("\n");
+    for (const content of ["EXPANDED_TAIL", "Attachment: note.txt", "Via extension: synthetic-extension", "Reply to parent-m"]) {
+      assert.ok(rendered.includes(content), content);
     }
-  });
-}
+  }
+});
 
 const ignoredMouseEvents: Array<Partial<TuiMouseEvent>> = [
   ...(["press", "release", "move", "drag", "wheel"] as const).map((type) => ({ type })),
@@ -279,18 +272,16 @@ const ignoredMouseEvents: Array<Partial<TuiMouseEvent>> = [
   { shift: true }, { alt: true }, { ctrl: true }, { clickCount: 2 }, { clickCount: 3 },
 ];
 
-for (const collapsed of [true, false]) {
-  test(`inline mouse fallback preserves ${collapsed ? "collapsed" : "expanded"} output for non-single-primary events`, () => {
-    const component: Component = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply", undefined, collapsed);
-    const before = component.render(100);
-    for (const ignored of ignoredMouseEvents) {
-      assert.equal(component.handleMouse?.(mouseEvent(component, 0, ignored)), undefined, JSON.stringify(ignored));
-      assert.deepEqual(component.render(100), before);
-    }
-  });
-}
+test("inline mouse fallback preserves output for non-single-primary events", () => {
+  const component: Component = new InlineMessageComponent(from, clickMessage, theme as any, "intercom reply");
+  const before = component.render(100);
+  for (const ignored of ignoredMouseEvents) {
+    assert.equal(component.handleMouse?.(mouseEvent(component, 0, ignored)), undefined, JSON.stringify(ignored));
+    assert.deepEqual(component.render(100), before);
+  }
+});
 
-test("inline click expands a frozen message without mutating it", () => {
+test("inline rendering and clicking preserve frozen messages", () => {
   const frozen = structuredClone(clickMessage);
   Object.freeze(frozen.content.attachments![0]);
   Object.freeze(frozen.content.attachments);
@@ -298,36 +289,30 @@ test("inline click expands a frozen message without mutating it", () => {
   Object.freeze(frozen.provenance);
   Object.freeze(frozen);
   const before = structuredClone(frozen);
-  const component: Component = new InlineMessageComponent(Object.freeze({ ...from }), frozen, styledTheme() as any, "intercom reply", undefined, true);
+  const component: Component = new InlineMessageComponent(Object.freeze({ ...from }), frozen, styledTheme() as any, "intercom reply");
   component.handleMouse?.(mouseEvent(component, 1));
   assert.match(component.render(100).join("\n"), /EXPANDED_TAIL/);
   assert.deepEqual(frozen, before);
 });
 
-test("inline preview and wrapped body caches avoid rereading text on repeated renders and click", () => {
+test("wrapped body caching avoids rereading text at the same width and across clicks", () => {
   let reads = 0;
   const cachedMessage = { ...clickMessage, content: { get text() { reads++; return clickMessage.content.text; } } };
-  const component: Component = new InlineMessageComponent(from, cachedMessage, theme as any, undefined, undefined, true);
-  component.render(100);
-  const previewReads = reads;
-  component.render(100);
-  component.render(80);
-  assert.equal(reads, previewReads, "collapsed preview is reused across widths");
-  component.handleMouse?.(mouseEvent(component, 0));
-  assert.equal(reads, previewReads, "handler does not scan body text");
+  const component: Component = new InlineMessageComponent(from, cachedMessage, theme as any);
   assert.match(component.render(100).join("\n"), /EXPANDED_TAIL/);
   const bodyReads = reads;
   component.render(100);
+  component.handleMouse?.(mouseEvent(component, 0));
   component.invalidate();
   component.render(100);
-  assert.equal(reads, bodyReads, "same-width body cache survives invalidate");
+  assert.equal(reads, bodyReads, "same-width cache survives clicks and invalidation");
   component.render(80);
   assert.ok(reads > bodyReads, "new body width rewraps the body");
 });
 
-test("collapsed inline hint retains Ctrl+O and advertises fullscreen message clicks", () => {
-  const component = new InlineMessageComponent(from, clickMessage, theme as any, undefined, undefined, true);
+test("incoming message cards have no folding hints", () => {
+  const component = new InlineMessageComponent(from, clickMessage, theme as any);
   const output = component.render(160).join("\n");
-  assert.match(output, /Ctrl\+O/);
-  assert.match(output, /click.*message.*fullscreen/i);
+  assert.match(output, /EXPANDED_TAIL/);
+  assert.doesNotMatch(output, /Ctrl\+O|click.*message.*fullscreen/i);
 });

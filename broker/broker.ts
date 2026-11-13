@@ -16,13 +16,13 @@ import {
   restrictIntercomRuntimeFile,
   type BrokerConnectTarget,
 } from "./paths.ts";
-import { getAskTimeoutMs } from "../config.ts";
+import { getAskTimeoutMs, getListLocationScope } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
 import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE } from "../types.ts";
 import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
-import { resolveHerdrLocations } from "../herdr-location.ts";
+import { filterSessionsByLocationScope, resolveHerdrLocations } from "../herdr-location.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -704,7 +704,12 @@ class IntercomBroker {
             .map(session => [session.info.id, session.herdrSessionPath!] as const),
         );
         void resolveHerdrLocations(sessions, { sessionPaths: herdrSessionPaths })
-          .then((resolvedSessions) => writeMessage(socket, { type: "sessions", requestId, sessions: resolvedSessions }))
+          .then((resolvedSessions) => {
+            const scopedSessions = filterSessionsByLocationScope(
+              resolvedSessions, requester.info.id, getListLocationScope(),
+            );
+            writeMessage(socket, { type: "sessions", requestId, sessions: scopedSessions });
+          })
           .catch((cause) => {
             const detail = cause instanceof Error ? cause.message : String(cause);
             const fallback = sessions.map((session) => ({

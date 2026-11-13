@@ -29,7 +29,7 @@ Each pi session that has `pi-intercom` loaded and enabled connects to a tiny loc
 ## Install
 
 ```bash
-pi install npm:pi-intercom
+pi install git:github.com/mimoren/pi-intercom
 ```
 
 Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
@@ -147,9 +147,7 @@ The reply hint (enabled by default) points to `intercom({ action: "reply", ... }
 
 A sender can mark a `send` as information only with `noWake: true` (`--no-wake` in the CLI). An idle recipient then gets the message in its transcript without starting a turn, and the model reads it with the recipient's next turn. Busy recipients get it the same way as any other message. Asks and replies, including a `send` that answers a pending ask, always wake the recipient, and `inboundTrigger: "replies"` or `"never"` still applies as configured.
 
-In fullscreen mode, a plain left-click anywhere on an intercom message expands or collapses just that message; click again to undo. Only the display changes, not the message content, what the model sees, or session history. Dragging to select text, clicking links, wheel scrolling, and double- or triple-click word and line selection keep working and do not toggle the message, though the first click of a rapid double-click can. Regular mode leaves mouse input to the terminal.
-
-Ctrl+O still expands or collapses every message and clears per-message choices. Those choices are not saved: reloading, resuming, or forking a session, or anything that rebuilds the whole transcript, returns each message to the Ctrl+O state.
+Incoming message cards always show their complete body, reply hints, attachments, and provenance. Ctrl+O and mouse clicks do not fold intercom messages; tool cards keep Pi's normal expansion behavior.
 
 ## Workflow: Planner-Worker Coordination
 
@@ -478,6 +476,7 @@ Create `~/.pi/agent/intercom/config.json`:
   "confirmSend": false,
   "inboundTrigger": "always",
   "busyDelivery": "steer",
+  "listLocationScope": "machine",
   "enabled": true,
   "replyHint": true,
   "status": "researching",
@@ -495,6 +494,7 @@ Create `~/.pi/agent/intercom/config.json`:
 | `confirmSend` | false | Show a confirmation dialog before ordinary or inferred sends from an interactive session with UI; caller-supplied `replyTo` skips it |
 | `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
 | `busyDelivery` | `"steer"` | `"steer"` promptly steers peers into active interactive runs. Opt into `"human-first"` to hold peers until a turn boundary with no pending human input; one held peer is released per turn. Non-interactive busy behavior is unchanged. |
+| `listLocationScope` | `"machine"` | Session-list visibility: `"machine"` shows the full roster; `"workspace"` or `"tab"` shows the current session and peers in the same live Herdr workspace or tab. If the viewer's location cannot be resolved, the roster stays unfiltered. Explicit name/session-ID sends remain available outside the visible list. |
 | `enabled` | true | Enable/disable intercom entirely |
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
@@ -688,7 +688,7 @@ Runtime files live at `~/.pi/agent/intercom/` by default, or `$PI_CODING_AGENT_D
 - `broker.port.json` — Dynamic localhost TCP endpoint, only when Windows TCP transport is explicitly enabled
 - `config.json` — User configuration
 
-Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `busyDelivery` (`steer` or `human-first`), `replyHint`, `confirmSend`, and advanced broker launch overrides.
+Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `busyDelivery` (`steer` or `human-first`), `listLocationScope` (`machine`, `workspace`, or `tab`), `replyHint`, `confirmSend`, and advanced broker launch overrides.
 
 ## Design Decisions
 

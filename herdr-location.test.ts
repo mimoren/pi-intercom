@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveHerdrLocations } from "./herdr-location.ts";
+import { filterSessionsByLocationScope, resolveHerdrLocations } from "./herdr-location.ts";
 import { createHerdrClient, type HerdrClient, type HerdrResult } from "./project-agent.ts";
 import type { SessionInfo } from "./types.ts";
 
@@ -15,6 +15,41 @@ function session(id: string, herdrPaneId?: string): SessionInfo {
     lastActivity: 1,
     ...(herdrPaneId ? { herdrPaneId } : {}),
   };
+}
+
+function located(id: string, workspace: string, tab: string): SessionInfo {
+  return { ...session(id), herdrLocation: {
+    status: "current", workspace: { id: workspace, label: workspace },
+    tab: { id: tab, label: tab }, paneId: id, refreshedAt: 1,
+  } };
+}
+
+test("roster location scopes preserve machine view and filter current workspace or tab", () => {
+  const inputs = [
+    located("self", "w1", "t1"), located("same-tab", "w1", "t1"),
+    located("other-tab", "w1", "t2"), located("other-workspace", "w2", "t3"),
+    session("unknown"), { ...session("shell"), herdrLocation: { status: "not_hosted" as const } },
+    { ...session("gone"), herdrLocation: { status: "unavailable" as const, paneId: "gone", reason: "pane_missing" as const } },
+  ];
+  const before = structuredClone(inputs);
+  assert.strictEqual(filterSessionsByLocationScope(inputs, "self", "machine"), inputs);
+  assert.deepEqual(filterSessionsByLocationScope(inputs, "self", "workspace").map(item => item.id), ["self", "same-tab", "other-tab"]);
+  assert.deepEqual(filterSessionsByLocationScope(inputs, "self", "tab").map(item => item.id), ["self", "same-tab"]);
+  assert.deepEqual(inputs, before);
+});
+
+for (const scope of ["workspace", "tab"] as const) {
+  test(`${scope} roster fails open when the viewer location is missing or unresolved`, () => {
+    for (const self of [
+      session("self"),
+      { ...session("self"), herdrLocation: { status: "not_hosted" as const } },
+      { ...session("self"), herdrLocation: { status: "unavailable" as const, paneId: "self", reason: "pane_missing" as const } },
+    ]) {
+      const inputs = [self, located("peer", "w1", "t1")];
+      assert.strictEqual(filterSessionsByLocationScope(inputs, "self", scope), inputs);
+      assert.strictEqual(filterSessionsByLocationScope(inputs, "missing-viewer", scope), inputs);
+    }
+  });
 }
 
 function snapshot(workspaceId: string, workspaceLabel: string, tabId: string, tabLabel: string, paneId = "pane-1"): unknown {

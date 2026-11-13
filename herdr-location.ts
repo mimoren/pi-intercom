@@ -1,3 +1,4 @@
+import type { ListLocationScope } from "./config.ts";
 import type { HerdrClient } from "./project-agent.ts";
 import { createHerdrClient } from "./project-agent.ts";
 import type { HerdrLocation, SessionInfo } from "./types.ts";
@@ -31,6 +32,23 @@ function recordsField(value: unknown, key: string): RecordValue[] | undefined {
 
 function unavailable(paneId: string, reason: Extract<HerdrLocation, { status: "unavailable" }>['reason'], detail?: string): HerdrLocation {
   return { status: "unavailable", paneId, reason, ...(detail ? { detail } : {}) };
+}
+
+/** Filter only the roster view; explicit session addressing remains available. */
+export function filterSessionsByLocationScope(
+  sessions: SessionInfo[], selfId: string, scope: ListLocationScope,
+): SessionInfo[] {
+  if (scope !== "workspace" && scope !== "tab") return sessions;
+  const self = sessions.find((session) => session.id === selfId)?.herdrLocation;
+  if (!self || self.status !== "current") return sessions;
+  return sessions.filter((session) => {
+    if (session.id === selfId) return true;
+    const location = session.herdrLocation;
+    if (!location || location.status !== "current") return false;
+    return scope === "tab"
+      ? location.tab.id === self.tab.id
+      : location.workspace.id === self.workspace.id;
+  });
 }
 
 /**

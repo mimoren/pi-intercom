@@ -2342,21 +2342,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
   });
 
-  // Key by the outer CustomMessage, which the host reuses across child rebuilds.
-  const inlineMessageExpansion = new WeakMap<object, { globalExpanded: boolean; expanded: boolean }>();
-  pi.registerMessageRenderer("intercom_message", (message, options, theme) => {
+  pi.registerMessageRenderer("intercom_message", (message, _options, theme) => {
     const details = message.details as { from: SessionInfo; message: Message; replyCommand?: string; bodyText?: string } | undefined;
     if (!details) return undefined;
-    let expansionState = inlineMessageExpansion.get(message);
-    if (!expansionState) {
-      expansionState = { globalExpanded: options.expanded, expanded: options.expanded };
-      inlineMessageExpansion.set(message, expansionState);
-    } else if (expansionState.globalExpanded !== options.expanded) {
-      // Reset in the callback, even when two global changes occur before render.
-      expansionState.globalExpanded = options.expanded;
-      expansionState.expanded = options.expanded;
-    }
-    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded, expansionState);
+    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText);
   });
 
   pi.on("tool_result", (event) => {
