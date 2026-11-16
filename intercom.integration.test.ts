@@ -754,7 +754,7 @@ test("a session refused for a held id stops retrying, tells the user once, and r
   const harness = createExtensionHarness("held-worker", {
     sessionId: "held-session",
     hasUI: true,
-    ui: { notify: (message: string) => { notifications.push(message); } },
+    ui: { addAutocompleteProvider: () => undefined, notify: (message: string) => { notifications.push(message); } },
   });
 
   try {
