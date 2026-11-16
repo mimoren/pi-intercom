@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import { fuzzyFilter, type AutocompleteProvider } from "@earendil-works/pi-tui";
 import type { SessionInfo } from "./types.ts";
+import { filterSessionsByLocationScope } from "./herdr-location.ts";
 
 export const MENTION_OWNER_EVENT = "clim:session-mentions:get-owner";
 export const MENTION_READY_EVENT = "clim:session-mentions:ready";
@@ -42,9 +43,8 @@ export function workspaceMentionPeers(sessions: SessionInfo[], selfId: string): 
   if (self?.status !== "current") {
     throw new Error("Session mentions require a resolved Herdr workspace. Check the Herdr connection and try again.");
   }
-  return sessions.filter((session) => session.id !== selfId
-    && session.herdrLocation?.status === "current"
-    && session.herdrLocation.workspace.id === self.workspace.id);
+  return filterSessionsByLocationScope(sessions, selfId, "workspace")
+    .filter((session) => session.id !== selfId);
 }
 
 export function sessionMentionLabel(session: SessionInfo): string {

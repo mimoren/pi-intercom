@@ -137,9 +137,10 @@ test("roster filtering uses live location without blocking explicit delivery", {
       }
     }
     writeFileSync(snapshotPath, JSON.stringify({ ...snapshot, panes: panes.filter(item => item.pane_id !== "self") }));
-    assert.deepEqual(await ids(), all, "unresolved viewer fails open");
+    assert.deepEqual(await ids(), ["self"], "unresolved hosted viewer must not expose other workspaces");
+    assert.deepEqual((await clients[0]!.listSessions({ global: true })).map(item => item.id).sort(), all, "explicit global listing remains available when location is unresolved");
     setScope("invalid");
-    assert.deepEqual(await ids(), all, "configuration errors retain the broker list fallback");
+    assert.deepEqual(await ids(), ["self"], "configuration errors keep the hosted fallback scoped");
   } finally {
     await Promise.all(clients.map(client => client.disconnect()));
     if (broker) await stopBroker(broker);

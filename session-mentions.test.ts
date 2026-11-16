@@ -22,6 +22,19 @@ test("mentions include other projects and tabs only inside the resolved current 
   assert.throws(() => workspaceMentionPeers([{ ...self, herdrLocation: { status: "unavailable", paneId: "gone", reason: "pane_missing" } }, remote], self.id), /resolved Herdr workspace/);
 });
 
+test("mention candidates include the main workspace but exclude sibling linked worktrees", () => {
+  const main = session("main-peer", "main", "main");
+  const child = session("child-peer", "child", "child");
+  const sibling = session("sibling-peer", "sibling", "sibling");
+  for (const item of [main, child, sibling]) {
+    if (item.herdrLocation?.status === "current") {
+      item.herdrLocation.workspace.worktree = { repoKey: "/repo/.git", isLinkedWorktree: item !== main };
+    }
+  }
+  assert.deepEqual(workspaceMentionPeers([main, child, sibling, remote], child.id), [main]);
+  assert.deepEqual(workspaceMentionPeers([main, child, sibling, remote], main.id), [child, sibling]);
+});
+
 test("mention tokens distinguish colliding short IDs and keep the selected full identity", () => {
   const peers = [frontend, reviewer];
   const token = sessionMentionToken(frontend, peers);

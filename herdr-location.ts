@@ -39,15 +39,27 @@ export function filterSessionsByLocationScope(
   sessions: SessionInfo[], selfId: string, scope: ListLocationScope,
 ): SessionInfo[] {
   if (scope !== "workspace" && scope !== "tab") return sessions;
-  const self = sessions.find((session) => session.id === selfId)?.herdrLocation;
-  if (!self || self.status !== "current") return sessions;
+  const viewer = sessions.find((session) => session.id === selfId);
+  const self = viewer?.herdrLocation;
+  if (!self || self.status !== "current") {
+    // Non-Herdr clients retain the ordinary machine roster. Hosted clients
+    // must not expose unrelated workspaces when live location lookup fails.
+    return viewer?.herdrPaneId || self?.status === "unavailable"
+      ? sessions.filter((session) => session.id === selfId)
+      : sessions;
+  }
   return sessions.filter((session) => {
     if (session.id === selfId) return true;
     const location = session.herdrLocation;
     if (!location || location.status !== "current") return false;
-    return scope === "tab"
-      ? location.tab.id === self.tab.id
-      : location.workspace.id === self.workspace.id;
+    if (scope === "tab") return location.tab.id === self.tab.id;
+    if (location.workspace.id === self.workspace.id) return true;
+    const parent = self.workspace.worktree;
+    const peer = location.workspace.worktree;
+    // Herdr groups linked worktrees under their main checkout. Compare the
+    // direct relation only: siblings must not inherit visibility transitively.
+    return Boolean(parent && peer && parent.repoKey === peer.repoKey
+      && parent.isLinkedWorktree !== peer.isLinkedWorktree);
   });
 }
 
@@ -141,11 +153,17 @@ export async function resolveHerdrLocations(
     if (!currentPaneId || !tabId || !workspaceId || !tabLabel || !workspaceLabel) {
       return { ...session, herdrLocation: unavailable(paneId, "invalid_response", "Herdr snapshot could not resolve the pane's current labeled tab and workspace.") };
     }
+    const worktree = record(workspace?.worktree);
+    const repoKey = stringField(worktree, "repo_key");
+    const isLinkedWorktree = worktree?.is_linked_worktree;
     return {
       ...session,
       herdrLocation: {
         status: "current",
-        workspace: { id: workspaceId, label: workspaceLabel },
+        workspace: { id: workspaceId, label: workspaceLabel,
+          ...(repoKey && typeof isLinkedWorktree === "boolean"
+            ? { worktree: { repoKey, isLinkedWorktree } } : {}),
+        },
         tab: { id: tabId, label: tabLabel },
         paneId: currentPaneId,
         refreshedAt,

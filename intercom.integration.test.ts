@@ -1278,6 +1278,114 @@ console.log(JSON.stringify({ result: { snapshot: {
   }
 });
 
+test("workspace rosters include direct worktree relatives while explicit messaging resolves globally", { concurrency: false }, async () => {
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-worktree-scope-"));
+  const fixtureBin = path.join(fixtureDir, "herdr-fixture");
+  const workspaceIds = ["scope-main", "scope-child", "scope-sibling", "scope-unrelated"];
+  const snapshot = {
+    panes: workspaceIds.map(id => ({ pane_id: `${id}:pane`, tab_id: `${id}:tab`, workspace_id: id })),
+    tabs: workspaceIds.map(id => ({ tab_id: `${id}:tab`, workspace_id: id, label: id })),
+    workspaces: workspaceIds.map((id, index) => ({ workspace_id: id, label: id, worktree: {
+      repo_key: index === 3 ? "/other/.git" : "/repo/.git", is_linked_worktree: index === 1 || index === 2,
+    } })),
+  };
+  writeFileSync(fixtureBin, `#!/usr/bin/env node\nconsole.log(${JSON.stringify(JSON.stringify({ result: { snapshot } }))});\n`);
+  chmodSync(fixtureBin, 0o755);
+  const peers = [new IntercomClient(), new IntercomClient(), new IntercomClient()];
+  const [main, sibling, outside] = peers as [IntercomClient, IntercomClient, IntercomClient];
+  const harness = createExtensionHarness("scope-child-author", { sessionId: "scope-author-full-id" });
+  try {
+    await withEnv("HERDR_BIN", fixtureBin, async () => {
+      await withIntercomConfig({}, async () => {
+        const setup = await setupClients();
+        try {
+          for (const [peer, id, name, cwd] of [
+            [main, "scope-main", "scope-main-peer", repoDir],
+            [sibling, "scope-sibling", "scope-sibling-worker", "/repo/sibling"],
+            [outside, "scope-unrelated", "scope-outside-worker", repoDir],
+          ] as const) {
+            await peer.connect({ name, cwd, model: "test", pid: process.pid, startedAt: 1, lastActivity: 1, herdrPaneId: `${id}:pane` }, `${id}-full-id`);
+          }
+          const extension = (await import("./index.ts")).default;
+          extension(harness.pi as never);
+          await withEnv("HERDR_PANE_ID", "scope-child:pane", async () => {
+            await harness.emitLifecycle("session_start");
+            const tool = harness.tools.find(item => item.name === "intercom")!;
+            const signal = AbortSignal.timeout(15_000);
+            const call = (params: Record<string, unknown>) => tool.execute("scope-test", params, signal, undefined, harness.ctx);
+            const ordinary = await call({ action: "list" });
+            assert.equal(ordinary.details?.roster?.peers, 1);
+            assert.match(ordinary.content[0]!.text, /scope-main-peer/);
+            assert.doesNotMatch(ordinary.content[0]!.text, /scope-sibling-worker|scope-outside-worker/);
+            const global = await call({ action: "list", global: true });
+            assert.match(global.content[0]!.text, /scope-sibling-worker/);
+            assert.match(global.content[0]!.text, /scope-outside-worker/);
+            assert.doesNotMatch((await call({ action: "list-cwd" })).content[0]!.text, /scope-outside-worker/);
+            assert.match((await call({ action: "list-cwd", global: true })).content[0]!.text, /scope-outside-worker/);
+            assert.equal((await call({ action: "send", to: "scope-sibling-full-id", message: "invalid flag", global: true })).details?.error, true);
+            const mainRoster = (await main.listSessions()).map(item => item.id);
+            assert.ok(mainRoster.includes("scope-author-full-id"));
+            assert.ok(mainRoster.includes("scope-sibling-full-id"));
+            assert.ok(!mainRoster.includes("scope-unrelated-full-id"));
+            const siblingRoster = (await sibling.listSessions()).map(item => item.id);
+            assert.ok(siblingRoster.includes("scope-main-full-id"));
+            assert.ok(!siblingRoster.includes("scope-author-full-id"));
+            for (const params of [
+              { action: "send", to: "scope-sibling-work", message: "name prefix" },
+              { action: "send", to: "scope-sibling-full", message: "id prefix" },
+              { action: "send", cwd: "/repo/sibling", message: "cwd" },
+            ]) {
+              const received = once(sibling, "message");
+              const sent = await call(params);
+              assert.equal(sent.details?.delivered, true, JSON.stringify(sent));
+              await received;
+            }
+            const handoverReceived = once(sibling, "message");
+            const handoverContext = {
+              ...harness.ctx,
+              sessionManager: { ...harness.ctx.sessionManager, getBranch: () => [{ type: "message", id: "scope-history", parentId: null, timestamp: "2026-11-16T00:00:00.000Z", message: { role: "user", content: "Continue the workspace task", timestamp: 1 } }] },
+              modelRegistry: { streamSimple: () => ({ result: async () => ({ stopReason: "stop", content: [{ type: "text", text: "Continue the task" }] }) }) },
+            };
+            const handover = await tool.execute("scope-handover", { action: "handover", to: "scope-sibling-worker" }, signal, undefined, handoverContext);
+            assert.equal(handover.details?.delivered, true, JSON.stringify(handover));
+            await handoverReceived;
+            const askReceived = once(sibling, "message") as Promise<[SessionInfo, Message]>;
+            const asking = call({ action: "ask", to: "scope-sibling-work", message: "cross-sibling ask" });
+            const [sender, message] = await askReceived;
+            assert.equal((await sibling.send(sender.id, { text: "cross-sibling reply", replyTo: message.id })).delivered, true);
+            assert.match((await asking).content[0]!.text, /cross-sibling reply/);
+            const inbound = await sibling.send("scope-author-full-id", { text: "reverse ask", expectsReply: true });
+            assert.equal(inbound.delivered, true);
+            await waitForCondition(() => harness.sentMessages.some(item => JSON.stringify(item).includes("reverse ask")), "cross-workspace inbound ask");
+            const replyReceived = once(sibling, "message") as Promise<[SessionInfo, Message]>;
+            assert.equal((await call({ action: "reply", message: "reverse reply" })).details?.delivered, true);
+            assert.equal((await replyReceived)[1].replyTo, inbound.id);
+            for (const global of [false, true]) {
+              const result = await new Promise<{ code: number | null; output: string; error: string }>((resolve) => {
+                const child = spawn(process.execPath, [path.join(repoDir, "cli.mjs"), "list", "--json", ...(global ? ["--global"] : [])], { cwd: repoDir, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+                let output = ""; let error = "";
+                child.stdout.on("data", chunk => { output += chunk; });
+                child.stderr.on("data", chunk => { error += chunk; });
+                child.once("exit", code => resolve({ code, output, error }));
+              });
+              assert.equal(result.code, 0, result.error);
+              const ids = JSON.parse(result.output).sessions.map((item: SessionInfo) => item.id);
+              assert.equal(ids.includes("scope-sibling-full-id"), global);
+              assert.ok(ids.includes("scope-main-full-id"));
+            }
+          });
+        } finally {
+          await harness.emitLifecycle("session_shutdown");
+          await Promise.all(peers.map(peer => peer.disconnect()));
+          await setup.cleanup();
+        }
+      });
+    });
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
 test("workspace mentions select recipients, request AI composition and deliver independent notifications", { concurrency: false }, async () => {
   const { CombinedAutocompleteProvider } = await import("@earendil-works/pi-tui");
   const fixtureDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-mentions-"));
@@ -1377,15 +1485,15 @@ test("workspace mentions select recipients, request AI composition and deliver i
             assert.equal(received[0]!.replyTo, undefined, "notifications must never answer an unrelated pending ask");
             const pending = await tool.execute("pending-after-notify", { action: "pending" }, signal, undefined, harness!.ctx);
             assert.ok(JSON.stringify(pending).includes(ask.id), "the pending ask remains open");
-            const forbidden = await tool.execute("notify-outside", { action: "notify", to: "mention-outside-full-id", message: "do not deliver" }, signal, undefined, harness!.ctx);
-            assert.equal(forbidden.details?.error, true);
+            const crossWorkspace = await tool.execute("notify-outside", { action: "notify", to: "mention-outside-full-id", message: "explicit cross-workspace notification" }, signal, undefined, harness!.ctx);
+            assert.equal(crossWorkspace.details?.delivered, true, "explicit notifications resolve globally without flags");
             const aborted = new AbortController(); aborted.abort();
             const cancelled = await tool.execute("notify-aborted", { action: "notify", to: "mention-peer-full-id", message: "do not deliver" }, aborted.signal, undefined, harness!.ctx);
             assert.equal(cancelled.details?.error, true);
             moveOnConfirm = true;
-            const moved = await tool.execute("notify-moved-during-confirm", { action: "notify", to: "mention-peer-full-id", message: "do not deliver" }, signal, undefined, harness!.ctx);
-            assert.equal(moved.details?.error, true);
-            assert.match(moved.content[0]!.text, /left this workspace while confirmation was open/);
+            const moved = await tool.execute("notify-moved-during-confirm", { action: "notify", to: "mention-peer-full-id", message: "follow the same endpoint across workspaces" }, signal, undefined, harness!.ctx);
+            assert.equal(moved.details?.delivered, true);
+            await waitForCondition(() => received.length === 2, "notification after workspace move");
             const staleInput = (await harness!.emitLifecycleResults("input", { source: "interactive", text: input }))[0];
             assert.deepEqual(staleInput, { action: "handled" });
             assert.equal(editorText, input, "failed validation restores the submitted draft");
@@ -1394,7 +1502,7 @@ test("workspace mentions select recipients, request AI composition and deliver i
             await harness!.emitLifecycle("input", { source: "interactive", text: input });
             assert.equal(editorText, "A newer draft being edited", "a failed submission must not overwrite a newer draft");
             assert.ok(harness!.entries.some((entry) => entry.type === "intercom_notification_draft" && (entry.data as { text: string }).text === input), "the unsent draft is saved for recovery");
-            assert.equal(received.length, 1);
+            assert.equal(received.length, 2);
             // Unknown workspace identity must not fall back to the machine-wide roster.
             assert.deepEqual(await setup.planner.listSessions({ locationScope: "workspace" }), []);
 
@@ -1435,13 +1543,13 @@ test("workspace mentions select recipients, request AI composition and deliver i
             const changedEndpoint = await tool.execute("notify-old-selected-epoch", { action: "notify", to: "mention-peer-full-id", targetEpoch: selectedEpoch, message: "must not reach replacement" }, signal, undefined, harness!.ctx);
             assert.equal(changedEndpoint.details?.error, true);
             assert.match(changedEndpoint.content[0]!.text, /endpoint changed after selection/);
-            assert.equal(received.length, 1);
+            assert.equal(received.length, 2);
             const freshCandidates = await adapter.listCandidates();
             const freshEpoch = (freshCandidates[0]!.binding as { endpointEpoch: string }).endpointEpoch;
             assert.notEqual(freshEpoch, selectedEpoch);
             const fresh = await tool.execute("notify-current-selected-epoch", { action: "notify", to: "mention-peer-full-id", targetEpoch: freshEpoch, message: "composed for the selected endpoint" }, signal, undefined, harness!.ctx);
             assert.equal(fresh.details?.delivered, true);
-            await waitForCondition(() => received.length === 2, "notification to selected current epoch");
+            await waitForCondition(() => received.length === 3, "notification to selected current epoch");
             const emptyEpoch = await tool.execute("notify-empty-epoch", { action: "notify", to: "mention-peer-full-id", targetEpoch: "", message: "must not send" }, signal, undefined, harness!.ctx);
             assert.equal(emptyEpoch.details?.error, true);
             activeOwner = { version: 2 };

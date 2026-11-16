@@ -603,7 +603,7 @@ export class IntercomClient extends EventEmitter {
     writeMessage(socket, { type: "extension_capabilities_update", extensions: extensions ?? [] });
   }
 
-  listSessions(options: { timeoutMs?: number; locationScope?: "workspace" } = {}): Promise<SessionInfo[]> {
+  listSessions(options: { timeoutMs?: number; locationScope?: "workspace"; global?: boolean } = {}): Promise<SessionInfo[]> {
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
@@ -629,7 +629,7 @@ export class IntercomClient extends EventEmitter {
       }, options.timeoutMs ?? 5000);
       this.pendingLists.set(requestId, { resolve: wrappedResolve, reject: wrappedReject });
       try {
-        writeMessage(socket, { type: "list", requestId, ...(options.locationScope ? { locationScope: options.locationScope } : {}) });
+        writeMessage(socket, { type: "list", requestId, ...(options.global ? { locationScope: "machine" as const } : options.locationScope ? { locationScope: options.locationScope } : {}) });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingLists.delete(requestId);
@@ -699,7 +699,7 @@ export class IntercomClient extends EventEmitter {
     }
 
     const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
-      const sessions = await this.listSessions();
+      const sessions = await this.listSessions({ global: true });
       const byId = sessions.find((session) => session.id === to);
       const byName = byId ? [] : sessions.filter((session) => session.name?.toLowerCase() === to.toLowerCase());
       const byPrefix = byId || byName.length > 0 ? [] : sessions.filter((session) => session.id.startsWith(to));

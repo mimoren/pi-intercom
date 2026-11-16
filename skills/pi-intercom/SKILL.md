@@ -14,7 +14,9 @@ The `intercom` tool description lists each action's call shape. This skill adds 
 ## Cheat sheet
 
 ```text
-intercom({ action: "list-cwd", cwd?: "/repo" })   # peers in a directory (default: yours); "list" shows every peer
+intercom({ action: "list" })                    # current Herdr workspace plus direct main/linked worktrees; sibling worktrees stay hidden
+intercom({ action: "list", global: true })      # all local peers when needed
+intercom({ action: "list-cwd", cwd?: "/repo", global?: true }) # directory filter; optional global view
 intercom({ action: "send", to, message })          # fire-and-forget, returns at once
 intercom({ action: "ask", to, message })           # waits for the reply
 intercom({ action: "pending" })                    # asks waiting on you: sender, message id, age, preview
@@ -23,13 +25,14 @@ intercom({ action: "reply", message, to? })        # answers an ask; `to` picks 
 
 ## Targeting
 
-- `to` plus `cwd` uses the directory as a guard.
+- `global` is only for `list`/`list-cwd`. Send, notify, ask, reply and handover resolve across local workspaces without any flag, including hidden siblings. The broker routing scope still applies.
+- `to` plus `cwd` uses the directory as a guard across all local workspaces.
 - `name@machine` or `<session-id>@machine` reaches a session on another machine: a saved Herdr machine, or any host `ssh machine` reaches without a prompt. Only `send` and `handover` work across machines: no `ask`, `replyTo`, attachments or `cwd`.
 - Address sessions by name or id. Herdr pane ids in `list` show location only.
 
 ## Asking and replying
 
-- **Ask needs a live peer.** `ask` to a session not in `list` fails at once. Use `send` instead: for a session that disconnected in the last 24 hours, the broker holds the message until it reconnects (same session id, or the same explicit name and directory).
+- **Ask needs a live peer.** `ask` to a disconnected session fails at once; a live peer hidden by the default workspace view remains reachable. Use `send` instead: for a session that disconnected in the last 24 hours, the broker holds the message until it reconnects (same session id, or the same explicit name and directory).
 - **One ask at a time.** A second `ask` while one waits fails with "Already waiting for a reply"; use `send`.
 - **Ask timeout** is 10 minutes by default (`PI_INTERCOM_ASK_TIMEOUT_MS`). For longer work, `send` the task and `ask` only at decision points.
 - **Reply** in the turn the ask arrived with just `message`. Later, or when several asks wait, run `pending` and pass `to` (or `replyTo` with the message id).

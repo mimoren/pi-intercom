@@ -86,7 +86,7 @@ Press **h** on a highlighted session to hand this session over to it instead (se
 
 ### Mention a session with `@`
 
-In the interactive Pi editor, type `@` to pick another connected session in the current Herdr workspace. The menu includes sessions in other projects and tabs, and shows their session names, directories and status. Use `/alias` to give a session a readable name.
+In the interactive Pi editor, type `@` to pick another connected session in the current Herdr workspace. The menu includes sessions in other projects and tabs within that workspace, plus its main checkout or linked worktree workspaces. A main workspace sees its linked worktrees; a linked worktree sees the main workspace, but not sibling worktrees. Candidates show session names, directories and status. Use `/alias` to give a session a readable name.
 
 With a compatible CLIM session-mentions owner installed, Intercom registers as a candidate and notification provider; CLIM owns the menu and input handling. Without that owner, Intercom keeps its standalone menu. An incompatible owner or failed provider registration reports an error and disables the old menu, preventing duplicate input handling.
 
@@ -95,7 +95,7 @@ With a compatible CLIM session-mentions owner installed, Intercom registers as a
 3. Add an instruction, for example `@frontend[12345678] explain the pagination decision we just agreed on`, then submit the prompt.
 4. The current AI uses the conversation to compose and send a self-contained notification, then reports the delivery result. Multiple selected recipients receive separate notifications. The editor and session history keep the original prompt; notification instructions are added only to the model's context.
 
-Mentions are bound to the full session ID and endpoint selected from the menu. Recipients are checked again on submission and before sending. If one disconnects, reconnects or moves to another workspace, select it again; a failed submission saves the unsent draft in session history and restores it when the editor is empty. Code examples and ordinary email addresses do not trigger notifications. While the AI is working, submissions follow Pi's normal steering or follow-up behavior.
+Mentions are bound to the full session ID and endpoint selected from the menu. Recipients are checked again on submission and before sending. If one disconnects, reconnects or leaves the visible workspace family before submission, select it again; a failed submission saves the unsent draft in session history and restores it when the editor is empty. Code examples and ordinary email addresses do not trigger notifications. While the AI is working, submissions follow Pi's normal steering or follow-up behavior.
 
 File completion remains available with `@./`, `@/`, `@~/`, or quoted paths. Session mentions require Pi's extension autocomplete support and a resolved Herdr workspace. Only sessions connected to the same Intercom routing scope are available; an unavailable workspace never falls back to the machine-wide roster.
 
@@ -109,10 +109,15 @@ intercom({ action: "list" })
 // → **Current session:**
 // → • executor (20d43841) — ~/projects/api (claude-sonnet-4 · 42% ctx) · Herdr Platform [w5] / API [w5:t2] / pane w5:p4 [self, idle]
 // → **Other sessions:**
-// → • research (6332faab) — ~/projects/api (claude-sonnet-4) · not under Herdr [same cwd, thinking]
+// → • research (6332faab) — ~/projects/api (claude-sonnet-4) · Herdr Platform [w5] / Research [w5:t3] / pane w5:p6 [same cwd, thinking]
 
-// List only peers in the same working directory
+// List all local sessions when cross-workspace discovery is needed
+intercom({ action: "list", global: true })
+
+// List visible peers in the same working directory
 intercom({ action: "list-cwd" })
+// Search that directory across all local workspaces
+intercom({ action: "list-cwd", global: true })
 
 // Send a message
 intercom({ action: "send", to: "research", message: "Check if UserService.validate() handles null" })
@@ -425,6 +430,7 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `action` | string | `"list"`, `"list-cwd"`, `"send"`, `"notify"`, `"ask"`, `"handover"`, `"reply"`, `"pending"`, `"status"`, or `"cancel"` |
+| `global` | boolean | For `list`/`list-cwd` only: include all local sessions across Herdr workspaces. Messaging always resolves globally without this flag. |
 | `to` | string | Target session name or ID. Without `cwd`, send/ask resolve it globally. With `cwd`, send/ask require the target to be in that directory. Also disambiguates reply. |
 | `message` | string | Message text (for send/notify/ask/reply), or the optional next task for `handover` |
 | `targetEpoch` | string | For notify only: endpoint selected by `@`; a changed endpoint is rejected. Older direct notifications may omit it. |
@@ -455,11 +461,11 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 ### intercom actions
 
-**`list`** — Returns the current session plus other active intercom-connected sessions with name, short ID, working directory, model, live status, and explicit Herdr location. For Herdr-hosted sessions, the broker joins the process's stable Pi session identity against one fresh `herdr api snapshot` per list request and returns readable workspace/tab labels together with their opaque IDs and the diagnostic pane ID. Workspace and tab are not registration-time values and are not cached, so moving a pane is reflected by the next list. `herdrLocation.status` is `current`, `not_hosted`, or `unavailable`; unavailable results include a reason such as `pane_missing` or `herdr_unavailable` rather than inviting inference from cwd or session name. A Herdr command failure does not prevent the rest of the roster from being returned. When no connected session advertises Herdr hosting, `list` does not invoke Herdr and preserves the ordinary roster shape and rendering without location lines. `herdrPaneId` is the launch alias and may be stale after a move; consumers needing the current diagnostic pane ID must use `herdrLocation.paneId`. Pane IDs are diagnostic metadata, not intercom addressing handles. Status is derived automatically from Pi lifecycle events: `idle`, `thinking`, or `tool:<name>`.
+**`list`** — Returns the current session plus other active intercom-connected sessions with name, short ID, working directory, model, live status, and explicit Herdr location. For Herdr-hosted sessions, the broker joins the process's stable Pi session identity against one fresh `herdr api snapshot` per list request and returns readable workspace/tab labels together with their opaque IDs and the diagnostic pane ID. Workspace and tab are not registration-time values and are not cached, so moving a pane is reflected by the next list. `herdrLocation.status` is `current`, `not_hosted`, or `unavailable`; unavailable results include a reason such as `pane_missing` or `herdr_unavailable` rather than inviting inference from cwd or session name. By default, Herdr-hosted viewers see only their current workspace and directly related main/linked worktree workspaces; sibling linked worktrees stay hidden from each other. Set `global: true` on `list` or `list-cwd` to include all sessions in the local routing scope. A hosted viewer whose location is unavailable sees only itself unless global listing is requested. Non-Herdr viewers retain the ordinary machine roster. When no connected session advertises Herdr hosting, `list` does not invoke Herdr and preserves the ordinary roster shape and rendering without location lines. `herdrPaneId` is the launch alias and may be stale after a move; consumers needing the current diagnostic pane ID must use `herdrLocation.paneId`. Pane IDs are diagnostic metadata, not intercom addressing handles. Status is derived automatically from Pi lifecycle events: `idle`, `thinking`, or `tool:<name>`.
 
 **`send`** — Sends a message to the specified session and returns immediately after delivery. If the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply `send` to a different target is rejected so a guessed parent/root CWD cannot receive an accidental reply. Zero or multiple pending-ask matches remain unthreaded sends outside the active ask turn. Set `confirmSend: true` to confirm ordinary and inferred sends. A caller-supplied `replyTo` skips confirmation. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
 
-**`notify`** — Sends an AI-composed new notification to an exact, currently connected session ID in the same Herdr workspace. Used by the `@` mention flow. It never infers `replyTo` or completes an unrelated pending ask, and honors `confirmSend`. Requires `to` and `message`; directory routing, attachments, reply, supersede, retry and `noWake` options are not supported. `@` requests also carry `targetEpoch`, which must match the endpoint selected from the menu; an empty or changed epoch fails without substitution. Older direct calls may omit it and bind to the endpoint live at tool execution, so they do not guarantee the same endpoint as an earlier selection. A missing or moved recipient fails rather than queueing offline mail.
+**`notify`** — Sends an AI-composed new notification to an exact, currently connected local session ID, including sessions outside the visible workspace family. Used by the `@` mention flow. It never infers `replyTo` or completes an unrelated pending ask, and honors `confirmSend`. Requires `to` and `message`; directory routing, attachments, reply, supersede, retry and `noWake` options are not supported. `@` requests also carry `targetEpoch`, which must match the endpoint selected from the menu; an empty or changed epoch fails without substitution. Older direct calls may omit it and bind to the endpoint live at tool execution, so they do not guarantee the same endpoint as an earlier selection. A missing recipient fails rather than queueing offline mail. Moving the same endpoint to another workspace does not block explicit delivery.
 
 **`ask`** — Requires a currently connected recipient, sends a message, and waits for the recipient to reply (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). A disconnected target fails immediately rather than queueing a blocking request. The reply is returned as the tool result. No confirmation dialog. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working. The same `to`, `cwd`, and `openProjectPaneIfMissing` targeting rules apply.
 
@@ -494,7 +500,7 @@ Create `~/.pi/agent/intercom/config.json`:
   "confirmSend": false,
   "inboundTrigger": "always",
   "busyDelivery": "steer",
-  "listLocationScope": "machine",
+  "listLocationScope": "workspace",
   "enabled": true,
   "replyHint": true,
   "status": "researching",
@@ -512,7 +518,7 @@ Create `~/.pi/agent/intercom/config.json`:
 | `confirmSend` | false | Show a confirmation dialog before ordinary or inferred sends from an interactive session with UI; caller-supplied `replyTo` skips it |
 | `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
 | `busyDelivery` | `"steer"` | `"steer"` promptly steers peers into active interactive runs. Opt into `"human-first"` to hold peers until a turn boundary with no pending human input; one held peer is released per turn. Non-interactive busy behavior is unchanged. |
-| `listLocationScope` | `"machine"` | Session-list visibility: `"machine"` shows the full roster; `"workspace"` or `"tab"` shows the current session and peers in the same live Herdr workspace or tab. If the viewer's location cannot be resolved, the roster stays unfiltered. Explicit name/session-ID sends remain available outside the visible list. |
+| `listLocationScope` | `"workspace"` | Default roster visibility: current Herdr workspace plus directly related main/linked worktrees; sibling worktrees stay isolated. `"tab"` restricts to the current tab; `"machine"` explicitly opts into the full local roster. An unresolved hosted viewer sees only itself; non-Herdr viewers retain the full roster. `global: true` on list/list-cwd or CLI `list --global` overrides the view for one call. Explicit messaging always resolves globally. |
 | `enabled` | true | Enable/disable intercom entirely |
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
@@ -639,9 +645,13 @@ pi-intercom ask --to planner --text "which API version?" --timeout-ms 180000
 
 # JSON output for scripts
 pi-intercom list --json
+# opt into all local workspaces for this listing only
+pi-intercom list --global --json
 ```
 
-Flags: `--to <name|session-id>`, `--text`, `--name <session-name>` (roster name, default `pi-intercom-cli`), `--timeout-ms` (ask only, default 120000), `--no-wake` (send to a local session only), `--json`. Exit codes: `0` success, `1` usage/connection/delivery failure, `2` ask timeout. With `--json`, every command prints one object with an `ok` field: `list` returns `{ ok: true, sessions: [...] }`, and failures return `ok: false` with `error` (plus `reason: "timeout"` on timeout).
+When `HERDR_PANE_ID` is inherited, CLI listing uses the same workspace visibility rules as the interactive extension. Outside Herdr, it lists the local routing scope. Cross-workspace sends and asks need no extra flag.
+
+Flags: `--global` (list only), `--to <name|session-id>`, `--text`, `--name <session-name>` (roster name, default `pi-intercom-cli`), `--timeout-ms` (ask only, default 120000), `--no-wake` (send to a local session only), `--json`. Exit codes: `0` success, `1` usage/connection/delivery failure, `2` ask timeout. With `--json`, every command prints one object with an `ok` field: `list` returns `{ ok: true, sessions: [...] }`, and failures return `ok: false` with `error` (plus `reason: "timeout"` on timeout).
 
 ### Cross-machine coordination over ssh
 

@@ -20,12 +20,12 @@ test("getConfigPath uses the centralized intercom runtime directory", () => {
   assert.equal(getConfigPath("/tmp/pi-agent/intercom"), join("/tmp/pi-agent", "intercom", "config.json"));
 });
 
-test("roster location scope defaults to machine", async () => {
+test("roster location scope defaults to workspace", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
   try {
     await withAgentDir(root, () => {
-      assert.equal(loadConfig().listLocationScope, "machine");
-      assert.equal(getListLocationScope(), "machine");
+      assert.equal(loadConfig().listLocationScope, "workspace");
+      assert.equal(getListLocationScope(), "workspace");
     });
   } finally {
     rmSync(root, { recursive: true, force: true });

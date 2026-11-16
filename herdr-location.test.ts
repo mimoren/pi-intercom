@@ -39,18 +39,47 @@ test("roster location scopes preserve machine view and filter current workspace 
 });
 
 for (const scope of ["workspace", "tab"] as const) {
-  test(`${scope} roster fails open when the viewer location is missing or unresolved`, () => {
+  test(`${scope} roster preserves non-Herdr clients and closes for unresolved hosted viewers`, () => {
     for (const self of [
       session("self"),
       { ...session("self"), herdrLocation: { status: "not_hosted" as const } },
-      { ...session("self"), herdrLocation: { status: "unavailable" as const, paneId: "self", reason: "pane_missing" as const } },
     ]) {
       const inputs = [self, located("peer", "w1", "t1")];
       assert.strictEqual(filterSessionsByLocationScope(inputs, "self", scope), inputs);
       assert.strictEqual(filterSessionsByLocationScope(inputs, "missing-viewer", scope), inputs);
     }
+    for (const self of [
+      session("self", "pane-self"),
+      { ...session("self", "pane-self"), herdrLocation: { status: "unavailable" as const, paneId: "pane-self", reason: "pane_missing" as const } },
+    ]) {
+      const inputs = [self, located("peer", "w1", "t1")];
+      assert.deepEqual(filterSessionsByLocationScope(inputs, "self", scope), [self]);
+      assert.strictEqual(filterSessionsByLocationScope(inputs, "self", "machine"), inputs);
+    }
   });
 }
+
+test("workspace visibility follows direct main/linked worktree relations without sibling leakage", () => {
+  const main = located("main", "root", "root:t1");
+  const child = located("child", "feature", "feature:t1");
+  const sibling = located("sibling", "fix", "fix:t1");
+  const unrelated = located("unrelated", "other", "other:t1");
+  for (const [item, repoKey, linked] of [
+    [main, "/repo/.git", false], [child, "/repo/.git", true],
+    [sibling, "/repo/.git", true], [unrelated, "/other/.git", false],
+  ] as const) {
+    if (item.herdrLocation?.status === "current") {
+      item.herdrLocation.workspace.worktree = { repoKey, isLinkedWorktree: linked };
+    }
+  }
+  const sessions = [main, child, sibling, unrelated, located("same-child", "feature", "feature:t2")];
+  const visible = (id: string) => filterSessionsByLocationScope(sessions, id, "workspace").map(item => item.id);
+  assert.deepEqual(visible("main"), ["main", "child", "sibling"]);
+  assert.deepEqual(visible("child"), ["main", "child", "same-child"]);
+  assert.deepEqual(visible("sibling"), ["main", "sibling"]);
+  assert.deepEqual(visible("unrelated"), ["unrelated"]);
+  assert.deepEqual(filterSessionsByLocationScope(sessions, "child", "tab").map(item => item.id), ["child"]);
+});
 
 function snapshot(workspaceId: string, workspaceLabel: string, tabId: string, tabLabel: string, paneId = "pane-1"): unknown {
   return {
@@ -105,6 +134,22 @@ test("resolves hosted and non-Herdr sessions from one current snapshot", async (
   });
   assert.equal(resolved[1]!.herdrLocation?.status, "current");
   assert.deepEqual(resolved[2]!.herdrLocation, { status: "not_hosted" });
+});
+
+test("resolves only valid worktree metadata from the live workspace", async () => {
+  for (const [worktree, expected] of [
+    [{ repo_key: "/repo/.git", is_linked_worktree: true }, { repoKey: "/repo/.git", isLinkedWorktree: true }],
+    [{ repo_key: "/repo/.git", is_linked_worktree: false }, { repoKey: "/repo/.git", isLinkedWorktree: false }],
+    [{ repo_key: "/repo/.git", is_linked_worktree: "false" }, undefined],
+    [{ repo_key: "", is_linked_worktree: true }, undefined],
+  ] as const) {
+    const data = snapshot("w1", "Repo", "t1", "Work") as { snapshot: { workspaces: Record<string, unknown>[] } };
+    data.snapshot.workspaces[0]!.worktree = worktree;
+    const resolved = await resolveHerdrLocations([session("self", "pane-1")], { client: client([{ ok: true, data }]) });
+    const location = resolved[0]!.herdrLocation;
+    assert.equal(location?.status, "current");
+    if (location?.status === "current") assert.deepEqual(location.workspace.worktree, expected);
+  }
 });
 
 test("refreshes a moved pane instead of retaining its old tab or workspace", async () => {

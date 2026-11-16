@@ -1264,7 +1264,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       let target: OutboxTarget;
       try {
         const currentClientSessionId = activeClient.sessionId;
-        const sessions = await activeClient.listSessions();
+        const sessions = await activeClient.listSessions({ global: true });
         if (!currentClientSessionId) {
           settleOutboxRequest(request.requestId, "failed", { code: "session_unavailable", detail: "Current session is not registered with intercom" });
           return;
@@ -1794,7 +1794,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
   }
   async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
-    const sessions = await activeClient.listSessions();
+    const sessions = await activeClient.listSessions({ global: true });
     const byId = sessions.find(s => s.id === nameOrId);
     if (byId) {
       return byId.id;
@@ -1832,7 +1832,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (result.delivered || firstTarget !== rawTo || result.code !== "E_TARGET_NOT_FOUND") {
       return { result, display, resolution: "" };
     }
-    const sessions = await activeClient.listSessions();
+    const sessions = await activeClient.listSessions({ global: true });
     const lowerName = rawTo.toLowerCase();
     const byNamePrefix = sessions.filter(s => s.name?.toLowerCase().startsWith(lowerName) ?? false);
     if (byNamePrefix.length > 1) {
@@ -1925,7 +1925,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     focus?: boolean;
     signal?: AbortSignal;
   }): Promise<DeliveryTarget> {
-    const sessions = await activeClient.listSessions();
+    const sessions = await activeClient.listSessions({ global: true });
     const currentSessionId = activeClient.sessionId;
     if (!currentSessionId) {
       throw new Error("Current session is not registered with intercom.");
@@ -1974,8 +1974,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       let notificationTarget: SessionInfo | undefined;
       if (request.notification) {
         if (signal?.aborted) throw new Error("Notification cancelled before delivery.");
-        notificationTarget = (await listMentionPeers()).find((session) => session.id === to);
-        if (!notificationTarget) throw new Error("Notification recipient is no longer connected in this workspace. Select the recipient again.");
+        notificationTarget = (await connectedClient.listSessions({ global: true })).find((session) => session.id === to);
+        if (!notificationTarget) throw new Error("Notification recipient is no longer connected. Select the recipient again.");
         if (request.targetEpoch !== undefined && notificationTarget.endpointEpoch !== request.targetEpoch) {
           throw new Error("Notification recipient endpoint changed after selection. Select the recipient again.");
         }
@@ -2098,8 +2098,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         }
       }
-      if (request.notification && confirmSend && !(await listMentionPeers()).some((session) => session.id === sendTo)) {
-        throw new Error("Notification recipient left this workspace while confirmation was open. Select the recipient again.");
+      if (request.notification && confirmSend && !(await connectedClient.listSessions({ global: true })).some((session) => session.id === sendTo)) {
+        throw new Error("Notification recipient disconnected while confirmation was open. Select the recipient again.");
       }
       if ((request.handover || request.notification) && signal?.aborted) {
         return { content: [{ type: "text", text: request.notification ? "Notification was cancelled before delivery." : "Handover was cancelled before delivery." }], details: { error: true } };
@@ -2842,13 +2842,14 @@ by "list" (a leading prefix of the ID is enough). Prefer the short id when two
 sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.
 
 Usage:
-  intercom({ action: "list" })                    → List active sessions
+  intercom({ action: "list" })                    → List sessions in the current Herdr workspace and its parent/child worktrees
+  intercom({ action: "list", global: true })      → List all local sessions; cross-workspace messaging needs no flag
   intercom({ action: "list-cwd" })                → List sessions in the current working directory
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
   intercom({ action: "send", to: "name-or-id", message: "...", noWake: true }) → Information only: an idle receiver reads it on its next turn instead of starting one
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
-  intercom({ action: "notify", to: "exact-session-id", message: "contextual notification" }) → Send a new workspace notification without replying to a pending ask
+  intercom({ action: "notify", to: "exact-session-id", message: "contextual notification" }) → Send a new notification without replying to a pending ask
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
   intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
@@ -2861,10 +2862,13 @@ Usage:
 
     parameters: Type.Object({
       action: StringEnum(["list", "list-cwd", "send", "notify", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'notify', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'notify' sends an AI-composed new message to an exact session ID in the current workspace, without inferring a reply. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
+        description: "Action: 'list', 'list-cwd', 'send', 'notify', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'notify' sends an AI-composed new message to an exact session ID, without inferring a reply. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
       }),
+      global: Type.Optional(Type.Boolean({
+        description: "Only for list/list-cwd: include all local sessions across Herdr workspaces. Explicit send/notify/ask/reply/handover targets always resolve globally without this flag.",
+      })),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). 'notify' requires an exact session ID in the current workspace. For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). 'notify' requires an exact session ID. For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
       message: Type.Optional(Type.String({
         description: "Message to send (for 'send', 'notify', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
@@ -2918,6 +2922,9 @@ Usage:
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
       const { action, to, message, targetEpoch, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
+      if (params.global !== undefined && action !== "list" && action !== "list-cwd") {
+        return { content: [{ type: "text", text: "global is only supported by list/list-cwd; messaging resolves globally without it." }], details: { error: true } };
+      }
       if (targetEpoch !== undefined && action !== "notify") {
         return { content: [{ type: "text", text: "targetEpoch is only supported by notify." }], details: { error: true } };
       }
@@ -2926,7 +2933,7 @@ Usage:
         case "list": {
           try {
             const mySessionId = connectedClient.sessionId;
-            const sessions = await connectedClient.listSessions();
+            const sessions = await connectedClient.listSessions({ global: params.global });
             const currentSession = sessions.find(s => s.id === mySessionId);
             const otherSessions = sessions.filter(s => s.id !== mySessionId);
 
@@ -2958,7 +2965,7 @@ Usage:
         case "list-cwd": {
           try {
             const mySessionId = connectedClient.sessionId;
-            const sessions = await connectedClient.listSessions();
+            const sessions = await connectedClient.listSessions({ global: params.global });
             const currentSession = sessions.find(s => s.id === mySessionId);
 
             if (!currentSession) {
@@ -3039,7 +3046,7 @@ Usage:
 
         case "notify": {
           if (!to || !message?.trim() || (targetEpoch !== undefined && (typeof targetEpoch !== "string" || !targetEpoch.trim())) || cwd || openProjectPaneIfMissing || replyTo || supersedes || retryOf || attachments?.length || noWake) {
-            return { content: [{ type: "text", text: "notify requires an exact workspace session ID and a composed message; routing, reply, attachment and noWake options are not supported." }], details: { error: true } };
+            return { content: [{ type: "text", text: "notify requires an exact session ID and a composed message; routing, reply, attachment and noWake options are not supported." }], details: { error: true } };
           }
           return deliverMessage(connectedClient, ctx, _signal, { to, message, targetEpoch, notification: true });
         }

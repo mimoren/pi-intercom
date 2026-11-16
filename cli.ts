@@ -3,7 +3,7 @@
  * Minimal CLI for scripted access to the local pi-intercom broker.
  *
  * Commands:
- *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts list [--json]
+ *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts list [--global] [--json]
  *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts send --to worker --text "build failed" [--no-wake] [--name <bridge-name>] [--json]
  *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts ask --to worker --text "status?" [--timeout-ms N] [--name <bridge-name>] [--json]
  *
@@ -34,7 +34,8 @@ import { parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import type { CrossMachineProvenance, Message, SessionInfo, SessionRegistration } from "./types.ts";
 
 export const CLI_USAGE = `usage: pi-intercom <list|send|ask> [--to <name|session-id>] [--text <message>]
-                        [--timeout-ms <n>] [--no-wake] [--name <session-name>] [--json]`;
+                        [--timeout-ms <n>] [--no-wake] [--name <session-name>] [--json]
+                        list [--global] [--json]`;
 
 export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
@@ -47,6 +48,7 @@ export interface CliOptions {
   name: string;
   json: boolean;
   noWake: boolean;
+  global: boolean;
 }
 
 export class CliUsageError extends Error {}
@@ -61,6 +63,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     name: "pi-intercom-cli",
     json: false,
     noWake: false,
+    global: false,
   };
 
   const [command, ...rest] = argv;
@@ -78,6 +81,10 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
+    if (arg === "--global") {
+      opts.global = true;
+      continue;
+    }
     if (arg === "--json") {
       opts.json = true;
       continue;
@@ -117,6 +124,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       throw new CliUsageError(`relay requires only --envelope-stdin (and optional --json)\n${CLI_USAGE}`);
     }
   } else {
+    if (opts.global && opts.command !== "list") throw new CliUsageError(`--global is only valid for list; messaging resolves globally without it\n${CLI_USAGE}`);
     if (opts.envelopeStdin) throw new CliUsageError(`--envelope-stdin is only valid for relay\n${CLI_USAGE}`);
     if (opts.noWake && opts.command !== "send") throw new CliUsageError(`--no-wake is only valid for send\n${CLI_USAGE}`);
     if (opts.command !== "list") {
@@ -132,7 +140,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
 export interface CliClient {
   sessionId?: string | null;
   connect(session: SessionRegistration, sessionId?: string): Promise<void>;
-  listSessions(options?: { timeoutMs?: number }): Promise<SessionInfo[]>;
+  listSessions(options?: { timeoutMs?: number; global?: boolean }): Promise<SessionInfo[]>;
   send(to: string, options: { text: string; expectsReply?: boolean; noWake?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string }>;
   on(event: "message", listener: (from: SessionInfo, message: Message) => void): unknown;
   disconnect(): Promise<void>;
@@ -156,6 +164,7 @@ export function buildCliRegistration(name: string, now = Date.now(), runtimeFall
     lastActivity: now,
     name,
     ...(runtimeFallbackAlias ? { runtimeFallbackAlias: true } : {}),
+    ...(process.env.HERDR_PANE_ID?.trim() ? { herdrPaneId: process.env.HERDR_PANE_ID.trim() } : {}),
     status: "idle",
   };
 }
@@ -208,7 +217,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
 
   try {
     if (opts.command === "list") {
-      const sessions = await deps.client.listSessions();
+      const sessions = await deps.client.listSessions({ global: opts.global });
       if (opts.json) {
         out.write(`${JSON.stringify({ ok: true, sessions: sessions.map(sessionRow) }, null, 2)}\n`);
       } else {
@@ -241,7 +250,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
       if (opts.to!.includes("@")) {
         if (!deps.crossMachineSend) return reportFailure("cross-machine delivery is unavailable");
         try {
-          const sessions = await deps.client.listSessions();
+          const sessions = await deps.client.listSessions({ global: true });
           const remote = await deps.crossMachineSend(opts.to as string, opts.text as string, resolveOrigin(sessions, opts.name, deps.machineName ?? "localhost", deps.client.sessionId));
           if (opts.json) out.write(`${JSON.stringify({ ok: true, delivered: true, crossMachine: true, machine: remote.machine.label, target: remote.agent.name })}\n`);
           else out.write(`delivered to ${relaySenderName({ name: remote.agent.name, machine: remote.machine.label })} over SSH\n`);

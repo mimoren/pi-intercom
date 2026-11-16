@@ -696,10 +696,11 @@ class IntercomBroker {
           .filter(session => sameScope(session.scopeId, requester.scopeId))
           .map(s => s.info);
         const requestId = clientMessage.requestId;
-        if (clientMessage.locationScope !== undefined && clientMessage.locationScope !== "workspace") {
+        if (clientMessage.locationScope !== undefined && clientMessage.locationScope !== "workspace" && clientMessage.locationScope !== "machine") {
           throw new Error("Invalid list location scope");
         }
         const workspaceOnly = clientMessage.locationScope === "workspace";
+        const locationScope = clientMessage.locationScope;
         // Resolve all hosted panes from one bounded live snapshot. Never retain
         // the result: moved panes must be re-resolved by the next list request.
         const herdrSessionPaths = new Map(
@@ -712,7 +713,7 @@ class IntercomBroker {
             const self = resolvedSessions.find((session) => session.id === requester.info.id);
             const scopedSessions = workspaceOnly && self?.herdrLocation?.status !== "current"
               ? []
-              : filterSessionsByLocationScope(resolvedSessions, requester.info.id, workspaceOnly ? "workspace" : getListLocationScope());
+              : filterSessionsByLocationScope(resolvedSessions, requester.info.id, locationScope ?? getListLocationScope());
             writeMessage(socket, { type: "sessions", requestId, sessions: scopedSessions });
           })
           .catch((cause) => {
@@ -723,7 +724,7 @@ class IntercomBroker {
                 ? { status: "unavailable" as const, paneId: session.herdrPaneId, reason: "command_failed" as const, detail }
                 : { status: "not_hosted" as const },
             }));
-            writeMessage(socket, { type: "sessions", requestId, sessions: workspaceOnly ? [] : fallback });
+            writeMessage(socket, { type: "sessions", requestId, sessions: workspaceOnly ? [] : filterSessionsByLocationScope(fallback, requester.info.id, locationScope ?? "workspace") });
           });
         break;
       }

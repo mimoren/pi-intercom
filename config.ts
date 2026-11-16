@@ -37,7 +37,7 @@ export type ListLocationScope = "machine" | "workspace" | "tab";
 
 /** Roster view filter read from the machine-global intercom config. */
 export function getListLocationScope(): ListLocationScope {
-  return loadConfig().listLocationScope ?? "machine";
+  return loadConfig().listLocationScope ?? "workspace";
 }
 
 export interface CrossMachineConfig {
@@ -69,7 +69,7 @@ export interface IntercomConfig {
   /** Optional stable intercom session ID for restart-stable addressing */
   stableId?: string;
 
-  /** Filter the roster by the viewer's live Herdr location; defaults to machine. */
+  /** Filter the roster by the viewer's live Herdr location; defaults to workspace. */
   listLocationScope?: ListLocationScope;
   
   /** Enable/disable intercom (default: true) */
@@ -87,7 +87,7 @@ export function getConfigPath(intercomDir: string = getIntercomDirPath()): strin
 }
 
 const defaults: IntercomConfig = {
-  listLocationScope: "machine",
+  listLocationScope: "workspace",
   brokerCommand: "npx",
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,

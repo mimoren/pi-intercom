@@ -40,7 +40,7 @@ export interface ProjectTargetResolution {
 }
 
 export interface ListSessionsClient {
-  listSessions(options?: { timeoutMs?: number }): Promise<SessionInfo[]>;
+  listSessions(options?: { timeoutMs?: number; global?: boolean }): Promise<SessionInfo[]>;
 }
 
 function error(code: HerdrErrorCode, message: string, details?: unknown): HerdrResult<never> {
@@ -262,7 +262,7 @@ export async function waitForProjectSession(client: ListSessionsClient, input: {
 
   while (Date.now() - startedAt < timeoutMs) {
     if (input.signal?.aborted) throw new Error("Cancelled");
-    const sessions = await client.listSessions({ timeoutMs: Math.min(5_000, timeoutMs) });
+    const sessions = await client.listSessions({ timeoutMs: Math.min(5_000, timeoutMs), global: true });
 
     if (input.to?.trim()) {
       const resolved = resolveTargetInCwd({

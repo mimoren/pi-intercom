@@ -36,6 +36,7 @@ interface FakeClientOptions {
 
 class FakeClient implements CliClient {
   registrations: SessionRegistration[] = [];
+  listOptions: Array<{ global?: boolean } | undefined> = [];
   sends: Array<{ to: string; text: string; expectsReply?: boolean; noWake?: boolean; crossMachine?: CrossMachineProvenance }> = [];
   disconnected = false;
   private readonly options: FakeClientOptions;
@@ -50,7 +51,8 @@ class FakeClient implements CliClient {
     if (this.options.connectError) throw this.options.connectError;
   }
 
-  async listSessions(): Promise<SessionInfo[]> {
+  async listSessions(options?: { global?: boolean }): Promise<SessionInfo[]> {
+    this.listOptions.push(options);
     if (this.options.listError) throw this.options.listError;
     return this.options.sessions ?? [];
   }
@@ -154,6 +156,28 @@ test("parseCliArgs keeps relay hidden and restricted to an stdin envelope", () =
     ["relay", "--envelope-stdin", "--envelope-stdin"],
   ]) {
     assert.throws(() => parseCliArgs(argv), /relay requires only --envelope-stdin/);
+  }
+});
+
+test("global is opt-in for listing and is rejected on messaging commands", async () => {
+  assert.equal(parseCliArgs(["list"]).global, false);
+  assert.equal(parseCliArgs(["list", "--global"]).global, true);
+  for (const command of ["send", "ask"]) {
+    assert.throws(() => parseCliArgs([command, "--to", "peer", "--text", "hi", "--global"]), /only valid for list/);
+  }
+  const client = new FakeClient();
+  assert.equal(await runCli(["list", "--global", "--json"], { client, out: new MemorySink(), err: new MemorySink() }), 0);
+  assert.deepEqual(client.listOptions, [{ global: true }]);
+});
+
+test("CLI registration carries the inherited Herdr pane for default workspace listing", () => {
+  const previous = process.env.HERDR_PANE_ID;
+  process.env.HERDR_PANE_ID = "w-cli:p1";
+  try {
+    assert.equal(buildCliRegistration("bridge", 42).herdrPaneId, "w-cli:p1");
+  } finally {
+    if (previous === undefined) delete process.env.HERDR_PANE_ID;
+    else process.env.HERDR_PANE_ID = previous;
   }
 });
 

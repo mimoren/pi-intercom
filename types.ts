@@ -17,7 +17,7 @@ export interface DeliveryDetails {
 export type HerdrLocation =
   | {
       status: "current";
-      workspace: { id: string; label: string };
+      workspace: { id: string; label: string; worktree?: { repoKey: string; isLinkedWorktree: boolean } };
       tab: { id: string; label: string };
       paneId: string;
       /** Time when the broker requested the live Herdr snapshot. */
@@ -159,7 +159,7 @@ export type ClientMessage =
   | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string }
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
-  | { type: "list"; requestId: string; locationScope?: "workspace" }
+  | { type: "list"; requestId: string; locationScope?: "workspace" | "machine" }
   | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
