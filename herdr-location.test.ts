@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { filterSessionsByLocationScope, resolveHerdrLocations } from "./herdr-location.ts";
+import { filterSessionsByLocationScope, paneAgentLabel, resolveHerdrAgentLabels, resolveHerdrLocations } from "./herdr-location.ts";
 import { createHerdrClient, type HerdrClient, type HerdrResult } from "./project-agent.ts";
 import type { SessionInfo } from "./types.ts";
 
@@ -230,6 +230,45 @@ test("matches the live Herdr snapshot contract when running under Herdr", {
   }
 });
 
+test("Agent labels follow Herdr's own display name and never infer an identity", () => {
+  assert.equal(paneAgentLabel({ pane_id: "p", agent: "pi", display_agent: "Kaoru", tokens: { role: "Kaoru" } }), "Kaoru");
+  assert.equal(paneAgentLabel({ agent: "pi" }), "Pi");
+  assert.equal(paneAgentLabel({ agent: "codex" }), "Codex");
+  assert.equal(paneAgentLabel({ agent: "claude" }), "Claude");
+  assert.equal(paneAgentLabel({ agent: "gemini" }), "gemini");
+  assert.equal(paneAgentLabel({ display_agent: "  Release\n" }), "Release");
+  assert.equal(paneAgentLabel({ display_agent: "\u0007" }), undefined);
+  assert.equal(paneAgentLabel({ tokens: { role: "Worker" } }), undefined, "a token alone is not a display name");
+  assert.equal(paneAgentLabel({}), undefined);
+  assert.equal(paneAgentLabel(undefined), undefined);
+});
+test("the client joins Agent labels from the live pane roster and fails open", async () => {
+  const hosted = { ...located("hosted", "w1", "t1"), herdrPaneId: "pane-1" };
+  const moved = { ...located("moved", "w1", "t1"), herdrPaneId: "pane-old", herdrLocation: {
+    status: "current" as const, workspace: { id: "w1", label: "w1" }, tab: { id: "t1", label: "t1" }, paneId: "pane-2", refreshedAt: 1,
+  } };
+  const plain = { ...session("shell"), herdrLocation: { status: "not_hosted" as const } };
+  const herdr = client([{ ok: true, data: { agents: [
+    { pane_id: "pane-1", agent: "pi", display_agent: "Worker" },
+    { pane_id: "pane-2", agent: "pi" },
+  ] } }]);
+  const resolved = await resolveHerdrAgentLabels([hosted, moved, plain], { client: herdr });
+  assert.deepEqual(resolved.map((item) => item.agentLabel), ["Worker", "Pi", undefined]);
+  assert.deepEqual(herdr.calls, [["agent", "list"]]);
+  // Older brokers only carry the launch alias; that pane is still the same session.
+  const legacy = client([{ ok: true, data: { agents: [{ pane_id: "pane-1", agent: "pi", display_agent: "Release" }] } }]);
+  assert.equal((await resolveHerdrAgentLabels([session("legacy", "pane-1")], { client: legacy }))[0]!.agentLabel, "Release");
+  const idle = client([]);
+  const inputs = [plain];
+  assert.strictEqual(await resolveHerdrAgentLabels(inputs, { client: idle }), inputs, "non-Herdr rosters never spawn Herdr");
+  assert.deepEqual(idle.calls, []);
+  const unavailable = client([{ ok: false, error: { code: "HERDR_UNAVAILABLE", message: "missing binary" } }]);
+  const unchanged = [hosted];
+  assert.strictEqual(await resolveHerdrAgentLabels(unchanged, { client: unavailable }), unchanged);
+  const malformed = client([{ ok: true, data: { agents: [] } }]);
+  const untouched = [hosted];
+  assert.strictEqual(await resolveHerdrAgentLabels(untouched, { client: malformed }), untouched);
+});
 test("preserves list data and marks location unavailable when the Herdr command fails", async () => {
   const herdr = client([{ ok: false, error: { code: "HERDR_UNAVAILABLE", message: "missing binary" } }]);
   const inputs = [session("hosted", "pane-1"), session("shell")];

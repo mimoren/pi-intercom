@@ -33,6 +33,60 @@ function recordsField(value: unknown, key: string): RecordValue[] | undefined {
 function unavailable(paneId: string, reason: Extract<HerdrLocation, { status: "unavailable" }>['reason'], detail?: string): HerdrLocation {
   return { status: "unavailable", paneId, reason, ...(detail ? { detail } : {}) };
 }
+/** Herdr prints the Agent label in its own sidebar and tab strip: one safe line only. */
+const UNSAFE_AGENT_LABEL = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu;
+const MAX_AGENT_LABEL_CHARS = 24;
+/** Herdr CLI kind → the name that tool shows for itself; unknown tools keep their own name. */
+const CLIENT_NAMES: Record<string, string> = { pi: "Pi", codex: "Codex", claude: "Claude" };
+function sanitizeAgentLabel(value: string | undefined): string | undefined {
+  const label = value?.replace(UNSAFE_AGENT_LABEL, " ").replace(/\s+/g, " ").trim();
+  return label ? [...label].slice(0, MAX_AGENT_LABEL_CHARS).join("") : undefined;
+}
+/**
+ * Herdr's own Agent label for one pane record. A source-scoped `display_agent`
+ * report (e.g. `clim:pi-role`, ADS) always wins; the raw CLI kind is only the
+ * fallback, so this never guesses an identity from a process title or task slug.
+ */
+export function paneAgentLabel(value: unknown): string | undefined {
+  const pane = record(value);
+  if (!pane) return undefined;
+  const display = sanitizeAgentLabel(stringField(pane, "display_agent"));
+  if (display) return display;
+  const kind = stringField(pane, "agent");
+  return kind ? sanitizeAgentLabel(CLIENT_NAMES[kind] ?? kind) : undefined;
+}
+/**
+ * Read-only Agent labels for a roster, joined against the pane ids the broker
+ * already projected. This stays on the client so a running broker needs no
+ * restart; any Herdr failure returns the roster untouched and the caller keeps
+ * its known CLI fallback. It never throws into the menu.
+ */
+export async function resolveHerdrAgentLabels(
+  sessions: SessionInfo[],
+  options: { client?: HerdrClient } = {},
+): Promise<SessionInfo[]> {
+  if (!sessions.some((session) => session.herdrPaneId)) return sessions;
+  const client = options.client ?? createHerdrClient();
+  const result = await client.run<RecordValue>(["agent", "list"], { timeoutMs: 3_000 });
+  if (result.ok === false) return sessions;
+  const agents = recordsField(result.data, "agents");
+  if (!agents) return sessions;
+  const labels = new Map<string, string>();
+  for (const agent of agents) {
+    const paneId = stringField(agent, "pane_id");
+    const label = paneAgentLabel(agent);
+    if (paneId && label) labels.set(paneId, label);
+  }
+  if (labels.size === 0) return sessions;
+  return sessions.map((session) => {
+    if (!session.herdrPaneId) return session;
+    const location = session.herdrLocation;
+    // Brokers that project the live pane id win; the launch alias is the older join key.
+    const label = (location?.status === "current" ? labels.get(location.paneId) : undefined)
+      ?? labels.get(session.herdrPaneId);
+    return label ? { ...session, agentLabel: label } : session;
+  });
+}
 
 /** Filter only the roster view; explicit session addressing remains available. */
 export function filterSessionsByLocationScope(

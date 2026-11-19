@@ -1386,6 +1386,131 @@ test("workspace rosters include direct worktree relatives while explicit messagi
   }
 });
 
+test("native notify payloads with empty optional defaults deliver once while true and stale epochs stay rejected", { concurrency: false }, async () => {
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-notify-defaults-"));
+  const fixtureBin = path.join(fixtureDir, "herdr-fixture");
+  const snapshot = {
+    panes: [
+      { pane_id: "notify-author", tab_id: "notify-author-tab", workspace_id: "notify-workspace" },
+      { pane_id: "notify-outside", tab_id: "notify-outside-tab", workspace_id: "notify-other-workspace" },
+    ],
+    tabs: [
+      { tab_id: "notify-author-tab", workspace_id: "notify-workspace", label: "Author" },
+      { tab_id: "notify-outside-tab", workspace_id: "notify-other-workspace", label: "Outside" },
+    ],
+    workspaces: [
+      { workspace_id: "notify-workspace", label: "Author workspace" },
+      { workspace_id: "notify-other-workspace", label: "Other workspace" },
+    ],
+  };
+  writeFileSync(fixtureBin, `#!/usr/bin/env node\nconsole.log(${JSON.stringify(JSON.stringify({ result: { snapshot } }))});\n`);
+  chmodSync(fixtureBin, 0o755);
+  const outside = new IntercomClient();
+  let harness: ReturnType<typeof createExtensionHarness> | undefined;
+  try {
+    await withEnv("HERDR_BIN", fixtureBin, async () => {
+      const setup = await setupClients();
+      try {
+      const registration = { name: "notify-outside", cwd: `${repoDir}/outside-project`, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(), herdrPaneId: "notify-outside" };
+      await outside.connect(registration, "notify-outside-full-id");
+      const received: Message[] = [];
+      outside.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+      harness = createExtensionHarness("notify-author", { sessionId: "notify-author-full-id" });
+      const extension = (await import("./index.ts")).default;
+      extension(harness.pi as never);
+      await withEnv("HERDR_PANE_ID", "notify-author", async () => {
+        await harness!.emitLifecycle("session_start");
+        const tool = harness!.tools.find((item) => item.name === "intercom")!;
+        const signal = AbortSignal.timeout(15_000);
+        const selectedEpoch = (await outside.listSessions()).find((session) => session.id === "notify-outside-full-id")!.endpointEpoch!;
+        assert.ok(selectedEpoch, "the selected recipient must publish an endpoint epoch");
+        // The recipient lives in another Herdr workspace; exact-ID notification resolves it
+        // globally, as the appendix promises. list keeps its own true/false semantics.
+        const ordinary = await tool.execute("notify-defaults-list", { action: "list" }, signal, undefined, harness!.ctx);
+        assert.equal(ordinary.details?.error, undefined);
+        const listFalse = await tool.execute("notify-defaults-list-false", { action: "list", global: false }, signal, undefined, harness!.ctx);
+        assert.equal(listFalse.content[0]!.text, ordinary.content[0]!.text, "global: false keeps the ordinary roster");
+        const machine = await tool.execute("notify-defaults-list-global", { action: "list", global: true }, signal, undefined, harness!.ctx);
+        assert.match(machine.content[0]!.text, /notify-other-workspace/, "global: true still lists the other workspace");
+        // This is the payload shape the native tool call actually produced: every optional
+        // field present with its empty/false default, plus the selected target and epoch.
+        const nativeDefaults = {
+          attachments: [],
+          cwd: "",
+          focus: false,
+          global: false,
+          messageId: "",
+          noWake: false,
+          openProjectPaneIfMissing: false,
+          replyTo: "",
+          retryOf: "",
+          supersedes: "",
+        };
+        const delivered = await tool.execute("notify-native-defaults", {
+          ...nativeDefaults,
+          action: "notify",
+          to: "notify-outside-full-id",
+          targetEpoch: selectedEpoch,
+          message: "hello from the native tool payload",
+        }, signal, undefined, harness!.ctx);
+        assert.equal(delivered.details?.delivered, true, JSON.stringify(delivered));
+        await waitForCondition(() => received.length === 1, "native default payload delivery");
+        assert.equal(received[0]!.content.text, "hello from the native tool payload");
+        const refused = await tool.execute("notify-native-defaults-global-true", {
+          ...nativeDefaults,
+          global: true,
+          action: "notify",
+          to: "notify-outside-full-id",
+          targetEpoch: selectedEpoch,
+          message: "must not reach the recipient",
+        }, signal, undefined, harness!.ctx);
+        assert.equal(refused.details?.error, true);
+        assert.match(refused.content[0]!.text, /global is only supported by list\/list-cwd/);
+        assert.equal(received.length, 1, "global: true is still refused before any delivery");
+        const badType = await tool.execute("notify-native-defaults-bad-global", {
+          ...nativeDefaults,
+          global: 0,
+          action: "notify",
+          to: "notify-outside-full-id",
+          targetEpoch: selectedEpoch,
+          message: "must not send either",
+        }, signal, undefined, harness!.ctx);
+        assert.equal(badType.details?.error, true);
+        assert.equal(received.length, 1, "only an explicit false counts as absent");
+        const withoutGlobal = await tool.execute("notify-without-global", { action: "notify", to: "notify-outside-full-id", targetEpoch: selectedEpoch, message: "four fields still work" }, signal, undefined, harness!.ctx);
+        assert.equal(withoutGlobal.details?.delivered, true, JSON.stringify(withoutGlobal));
+        await waitForCondition(() => received.length === 2, "four-field notification");
+        // The same tolerance applies to the other non-list actions, so a native payload cannot
+        // be blocked merely by repeating the empty default there either.
+        const sendFalse = await tool.execute("send-global-false", { action: "send", to: "notify-outside-full-id", message: "send ignores explicit false", global: false }, signal, undefined, harness!.ctx);
+        assert.equal(sendFalse.details?.delivered, true, JSON.stringify(sendFalse));
+        await waitForCondition(() => received.length === 3, "send with global: false");
+        // Reconnecting rotates the endpoint epoch; the empty defaults must not turn a stale
+        // selection into a delivery to the replacement process.
+        await outside.disconnect();
+        await outside.connect(registration, "notify-outside-full-id");
+        const stale = await tool.execute("notify-native-defaults-stale-epoch", {
+          ...nativeDefaults,
+          action: "notify",
+          to: "notify-outside-full-id",
+          targetEpoch: selectedEpoch,
+          message: "must not reach the replacement endpoint",
+        }, signal, undefined, harness!.ctx);
+        assert.equal(stale.details?.error, true);
+        assert.match(stale.content[0]!.text, /endpoint changed after selection/);
+        assert.equal(received.length, 3, "a stale epoch with empty defaults never delivers");
+      });
+      } finally {
+        await harness?.emitLifecycle("session_shutdown").catch(() => undefined);
+        await outside.disconnect().catch(() => undefined);
+        await setup.cleanup();
+      }
+    });
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
 test("workspace mentions select recipients, request AI composition and deliver independent notifications", { concurrency: false }, async () => {
   const { CombinedAutocompleteProvider } = await import("@earendil-works/pi-tui");
   const fixtureDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-mentions-"));
@@ -1405,7 +1530,14 @@ test("workspace mentions select recipients, request AI composition and deliver i
     workspaces: [{ workspace_id: "workspace-a", label: "Current workspace" }, { workspace_id: "workspace-outside", label: "Other workspace" }],
   };
   writeFileSync(snapshotPath, JSON.stringify(snapshot));
-  writeFileSync(fixtureBin, `#!/usr/bin/env node\nconst fs = require("node:fs"); console.log(JSON.stringify({ result: { snapshot: JSON.parse(fs.readFileSync(${JSON.stringify(snapshotPath)}, "utf8")) } }));\n`);
+  // `herdr agent list` supplies Herdr's own Agent label for the client-side display path.
+  const agentPath = path.join(fixtureDir, "agents.json");
+  writeFileSync(agentPath, JSON.stringify([
+    { pane_id: "mention-self", agent: "pi", display_agent: "Worker" },
+    { pane_id: "mention-peer", agent: "pi", display_agent: "Kaoru", tokens: { role: "Kaoru" } },
+    { pane_id: "mention-outside", agent: "pi" },
+  ]));
+  writeFileSync(fixtureBin, `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst args = process.argv.slice(2);\nconst read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));\nconsole.log(JSON.stringify({ result: args[0] === "agent" && args[1] === "list" ? { agents: read(${JSON.stringify(agentPath)}) } : { snapshot: read(${JSON.stringify(snapshotPath)}) } }));\n`);
   chmodSync(fixtureBin, 0o755);
   const peer = new IntercomClient();
   const outside = new IntercomClient();
@@ -1456,8 +1588,11 @@ test("workspace mentions select recipients, request AI composition and deliver i
             const suggestions = await provider.getSuggestions(["@"], 0, 1, options);
             assert.equal(suggestions?.items.length, 1);
             const selected = suggestions!.items[0]!;
-            assert.match(selected.description!, /another-project.*Other project/);
+            assert.equal(selected.description, "Kaoru · Current workspace / Other project · connected", "the row leads with the Herdr Agent label and renders no path");
+            assert.equal((selected as { search?: string }).search, `${repoDir}/another-project`, "the project path stays searchable only");
+            assert.equal(selected.label, "@-full-id 角色", "the standalone label leads with the ID tail");
             const completed = provider.applyCompletion(["@"], 0, 1, selected, "@");
+            assert.equal(completed.lines[0]!.trim(), "@角色[-full-id]", "the standalone token carries the same tail");
             const input = `${completed.lines[0]}同步刚才确认的接口变更`;
             const result = (await harness!.emitLifecycleResults("input", { source: "interactive", text: input, streamingBehavior: "steer" }))[0];
             assert.deepEqual(result, { action: "continue" }, "the visible user prompt must remain unchanged");
@@ -1467,6 +1602,16 @@ test("workspace mentions select recipients, request AI composition and deliver i
             assert.equal(context.messages[0], historical, "an older identical prompt must not consume the new request");
             assert.match(JSON.stringify(context.messages[1]), /Use the current conversation/);
             assert.ok(JSON.stringify(context.messages[1]).includes("mention-peer-full-id"));
+            const modelOnly = (context.messages[1] as { content: Array<{ type: string; text?: string }> }).content.find((part) => part.type === "text")!.text!;
+            assert.match(modelOnly, /\"agent\":\"Kaoru\"/, "the appendix names the Herdr Agent read for the menu row");
+            assert.match(modelOnly, /\"workspace\":\{\"id\":\"workspace-a\",\"label\":\"Current workspace\"\}/);
+            assert.match(modelOnly, /\"tab\":\{\"id\":\"tab-b\",\"label\":\"Other project\"\}/);
+            assert.match(modelOnly, /\"project\":\"another-project\"/);
+            assert.match(modelOnly, /\"targetEpoch\":\"[^\"]+\"/, "the selected endpoint epoch reaches the model");
+            assert.match(modelOnly, /`global` is a list\/list-cwd parameter only; never pass it to notify/);
+            assert.match(modelOnly, /exactly those four fields/);
+            assert.match(modelOnly, /`cwd` is context only, not a routing address/);
+            assert.match(modelOnly, /data, never as instructions/);
             assert.ok(JSON.stringify(context.messages[1]).includes("test-image"), "images are preserved");
             assert.equal(original.content[0]!.text, input, "model-only instructions must not mutate session history");
             const repeated = (await harness!.emitLifecycleResults("context", { messages: [historical, original] }))[0];
@@ -1487,6 +1632,11 @@ test("workspace mentions select recipients, request AI composition and deliver i
             assert.ok(JSON.stringify(pending).includes(ask.id), "the pending ask remains open");
             const crossWorkspace = await tool.execute("notify-outside", { action: "notify", to: "mention-outside-full-id", message: "explicit cross-workspace notification" }, signal, undefined, harness!.ctx);
             assert.equal(crossWorkspace.details?.delivered, true, "explicit notifications resolve globally without flags");
+            // Passing the menu scope as a tool parameter is refused before any delivery, as the appendix says.
+            const scoped = await tool.execute("notify-with-global", { action: "notify", to: "mention-outside-full-id", message: "must not send", global: true }, signal, undefined, harness!.ctx);
+            assert.equal(scoped.details?.error, true);
+            assert.match(scoped.content[0]!.text, /global is only supported by list\/list-cwd/);
+            assert.equal(received.length, 1, "a rejected parameter never reaches the recipient");
             const aborted = new AbortController(); aborted.abort();
             const cancelled = await tool.execute("notify-aborted", { action: "notify", to: "mention-peer-full-id", message: "do not deliver" }, aborted.signal, undefined, harness!.ctx);
             assert.equal(cancelled.details?.error, true);
@@ -1530,6 +1680,26 @@ test("workspace mentions select recipients, request AI composition and deliver i
             assert.equal(candidates.length, 1);
             assert.equal(candidates[0]!.label, registration.name);
             assert.equal(candidates[0]!.id, "mention-peer-full-id");
+
+            // The autocomplete path reuses one short roster per scope: a typing burst and
+            // @ -> @@ -> @ issue one broker query per scope, not one per keystroke.
+            const originalListSessions = IntercomClient.prototype.listSessions;
+            let listCalls = 0;
+            IntercomClient.prototype.listSessions = function patchedListSessions(options) {
+              ++listCalls;
+              return originalListSessions.call(this, options);
+            };
+            try {
+              for (let index = 0; index < 5; ++index) await adapter.listCandidates({ scope: "workspace" });
+              const workspaceCalls = listCalls;
+              assert.ok(workspaceCalls <= 1, `a workspace typing burst shares one roster query, got ${workspaceCalls}`);
+              for (let index = 0; index < 5; ++index) await adapter.listCandidates({ scope: "global" });
+              assert.equal(listCalls - workspaceCalls, 1, "global keeps its own roster query");
+              for (let index = 0; index < 5; ++index) await adapter.listCandidates({ scope: "workspace" });
+              assert.equal(listCalls - workspaceCalls - 1, 0, "@ -> @@ -> @ reuses the cached workspace roster");
+            } finally {
+              IntercomClient.prototype.listSessions = originalListSessions;
+            }
             const appendix = await adapter.buildContext({ text: "unique-user-body", targets: candidates });
             assert.ok(!appendix.includes("unique-user-body"), "provider returns only the context appendix");
             assert.match(appendix, /targetEpoch/);
@@ -1544,9 +1714,16 @@ test("workspace mentions select recipients, request AI composition and deliver i
             assert.equal(changedEndpoint.details?.error, true);
             assert.match(changedEndpoint.content[0]!.text, /endpoint changed after selection/);
             assert.equal(received.length, 2);
-            const freshCandidates = await adapter.listCandidates();
-            const freshEpoch = (freshCandidates[0]!.binding as { endpointEpoch: string }).endpointEpoch;
-            assert.notEqual(freshEpoch, selectedEpoch);
+            // The autocomplete menu reuses a short roster; it refreshes after that window,
+            // while buildContext above re-validated the endpoint immediately.
+            const freshDeadline = Date.now() + 3000;
+            let freshEpoch = selectedEpoch;
+            while (freshEpoch === selectedEpoch && Date.now() < freshDeadline) {
+              const freshCandidates = await adapter.listCandidates();
+              freshEpoch = (freshCandidates[0]!.binding as { endpointEpoch: string }).endpointEpoch;
+              if (freshEpoch === selectedEpoch) await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            assert.notEqual(freshEpoch, selectedEpoch, "the cached menu roster refreshes within its short window");
             const fresh = await tool.execute("notify-current-selected-epoch", { action: "notify", to: "mention-peer-full-id", targetEpoch: freshEpoch, message: "composed for the selected endpoint" }, signal, undefined, harness!.ctx);
             assert.equal(fresh.details?.delivered, true);
             await waitForCondition(() => received.length === 3, "notification to selected current epoch");

@@ -39,8 +39,9 @@ import { relaySenderName } from "./cross-machine-envelope.ts";
 import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
 import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import { formatHandoverMessage, generateHandoverBody, readGitState } from "./handover.ts";
+import { resolveHerdrAgentLabels } from "./herdr-location.ts";
 import { isIdleWakePending, releaseIdleWake, reserveIdleWake } from "./idle-wake.ts";
-import { createSessionMentionProvider, extractSessionMentions, notificationContext, notificationPrompt, resolveSessionMentionBinding, resolveSessionMentions, sessionMentionBinding, sessionMentionDescription, sessionMentionLabel, workspaceMentionPeers, MENTION_OWNER_EVENT, MENTION_READY_EVENT, type MentionOwnerV1, type MentionProviderV1, type SessionMentionBinding } from "./session-mentions.ts";
+import { createSessionMentionProvider, extractSessionMentions, globalMentionPeers, notificationContext, notificationPrompt, resolveSessionMentionBinding, resolveSessionMentions, sessionMentionBinding, sessionMentionContext, sessionMentionDescription, sessionMentionIdentity, sessionMentionLabel, synthesizedSessionAlias, workspaceMentionPeers, MENTION_OWNER_EVENT, MENTION_READY_EVENT, type MentionOwnerV1, type MentionProviderV1, type MentionRecipient, type MentionScope, type SessionMentionBinding } from "./session-mentions.ts";
 
 const INTERCOM_TOOL_NAME = "intercom";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
@@ -48,7 +49,6 @@ const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
 const INBOUND_MESSAGE_DEDUPE_MAX = 1000;
 const INBOUND_MESSAGE_DEDUPE_RETENTION_MS = 60 * 60 * 1000;
-const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat";
 const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
 const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
 const INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_SESSION_ID";
@@ -593,12 +593,7 @@ function parseOutboxRequestPayload(payload: unknown): { ok: true; request: Inter
   };
 }
 function resolveIntercomPresenceName(sessionName: string | undefined, sessionId: string): string {
-  const trimmedName = sessionName?.trim();
-  if (trimmedName) {
-    return trimmedName;
-  }
-  const normalizedSessionId = sessionId.startsWith("session-") ? sessionId.slice("session-".length) : sessionId;
-  return `${DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX}-${normalizedSessionId.slice(0, 18)}`;
+  return sessionName?.trim() || synthesizedSessionAlias(sessionId);
 }
 function buildPresenceIdentity(pi: ExtensionAPI, sessionId: string): { name: string; runtimeFallbackAlias: boolean } {
   const sessionName = pi.getSessionName();
@@ -739,7 +734,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let mentionOwnerError: string | undefined;
   const pendingMentionPrompts: Array<{ text: string; prompt: string; createdAt: number }> = [];
   const mentionPrompts = new Map<string, string>();
-  let mentionCache: { generation: number; client: IntercomClient; expiresAt: number; promise: Promise<SessionInfo[]> } | null = null;
+  // One short-lived roster per scope: typing bursts and @ -> @@ -> @ switches reuse it;
+  // buildContext always asks for a fresh roster before validating an endpoint.
+  const mentionCaches = new Map<MentionScope, { generation: number; client: IntercomClient; expiresAt: number; promise: Promise<SessionInfo[]> }>();
   let agentRunning = false;
   const heldInboundMessages: InboundMessageEntry[] = [];
   let heldInboundTimer: NodeJS.Timeout | null = null;
@@ -1694,46 +1691,70 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
-  async function listMentionPeers(cached = false): Promise<SessionInfo[]> {
+  async function listMentionPeers(scope: MentionScope = "workspace", cached = false): Promise<SessionInfo[]> {
     const generation = runtimeGeneration;
     const ctx = getLiveContext();
     if (!ctx) throw new Error("Intercom session is no longer active.");
     const activeClient = await ensureConnected("overlay");
     if (!activeClient.supportsFeature(EXACT_SEND_FEATURE)) throw new Error("Session notifications require a broker with exact endpoint delivery.");
-    if (cached && mentionCache?.generation === generation && mentionCache.client === activeClient && mentionCache.expiresAt > Date.now()) {
-      return mentionCache.promise;
+    const existing = cached ? mentionCaches.get(scope) : undefined;
+    if (existing && existing.generation === generation && existing.client === activeClient && existing.expiresAt > Date.now()) {
+      return existing.promise;
     }
-    const promise = activeClient.listSessions({ locationScope: "workspace" }).then((sessions) => {
+    const promise = activeClient.listSessions(scope === "global" ? { global: true } : { locationScope: "workspace" }).then((sessions) => {
       if (!getLiveContext(ctx, generation) || client !== activeClient) throw new Error("Intercom session changed. Select the recipient again.");
-      return workspaceMentionPeers(sessions, activeClient.sessionId!);
+      return scope === "global"
+        ? globalMentionPeers(sessions, activeClient.sessionId!)
+        : workspaceMentionPeers(sessions, activeClient.sessionId!);
     });
     if (cached) {
-      mentionCache = { generation, client: activeClient, expiresAt: Infinity, promise };
+      mentionCaches.set(scope, { generation, client: activeClient, expiresAt: Infinity, promise });
       void promise.then(
-        () => { if (mentionCache?.promise === promise) mentionCache.expiresAt = Date.now() + 1000; },
-        () => { if (mentionCache?.promise === promise) mentionCache = null; },
+        () => { const entry = mentionCaches.get(scope); if (entry?.promise === promise) entry.expiresAt = Date.now() + 1000; },
+        () => { if (mentionCaches.get(scope)?.promise === promise) mentionCaches.delete(scope); },
       );
     }
     return promise;
   }
+  /**
+   * Menu roster: the same cached peers, annotated with the live Herdr Agent label.
+   * Recipient validation keeps calling the plain roster above, so display data can
+   * never widen or weaken what `notify` will accept.
+   */
+  async function listMentionPeersForMenu(scope: MentionScope = "workspace"): Promise<SessionInfo[]> {
+    const peers = await listMentionPeers(scope, true);
+    return resolveHerdrAgentLabels(peers).catch(() => peers);
+  }
   const mentionAdapter: MentionProviderV1 = {
     id: "pi-intercom",
-    async listCandidates() {
-      return (await listMentionPeers()).map((session) => ({
+    scopes: ["workspace", "global"],
+    async listCandidates(input) {
+      const scope = input?.scope === "global" ? "global" : "workspace";
+      return (await listMentionPeersForMenu(scope)).map((session) => ({
         id: session.id,
         label: sessionMentionLabel(session),
         description: sessionMentionDescription(session),
-        binding: sessionMentionBinding(session),
+        context: sessionMentionContext(session),
+        search: session.cwd,
+        binding: sessionMentionBinding(session, scope),
       }));
     },
     async buildContext({ targets }) {
       if (!Array.isArray(targets) || targets.length === 0) throw new Error("Select a notification recipient from the @ menu.");
-      const peers = await listMentionPeers();
-      const validated = new Map<string, SessionInfo>();
+      const rosters = new Map<MentionScope, SessionInfo[]>();
+      const validated = new Map<string, MentionRecipient>();
       for (const candidate of targets) {
-        const target = resolveSessionMentionBinding(candidate.binding, peers);
+        const binding = candidate.binding as Partial<SessionMentionBinding> | undefined;
+        const scope: MentionScope = binding?.scope === "global" ? "global" : "workspace";
+        if (!rosters.has(scope)) rosters.set(scope, await listMentionPeers(scope));
+        const target = resolveSessionMentionBinding(candidate.binding, rosters.get(scope)!, scope);
         if (candidate.id !== target.id) throw new Error("The selected session identity changed. Select the recipient again.");
-        validated.set(target.id, target);
+        // The identity comes from the frozen selection snapshot, never from today's roster.
+        const identity = binding?.identity ?? sessionMentionIdentity(target);
+        // The same live session can be selected from both menus; one notification per exact ID,
+        // and the narrower workspace scope wins so the appendix does not depend on token order.
+        const seen = validated.get(target.id);
+        if (!seen || (seen.scope === "global" && scope === "workspace")) validated.set(target.id, { session: target, scope, identity });
       }
       return notificationContext([...validated.values()]);
     },
@@ -1743,7 +1764,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     selectedMentions.clear();
     pendingMentionPrompts.length = 0;
     mentionPrompts.clear();
-    mentionCache = null;
+    mentionCaches.clear();
     getLiveContext()?.ui?.setStatus?.("intercom-mentions", undefined);
   }
   function reportMentionOwnerError(error: unknown): void {
@@ -2220,7 +2241,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     selectedMentions.clear();
     pendingMentionPrompts.length = 0;
     mentionPrompts.clear();
-    mentionCache = null;
+    mentionCaches.clear();
     outboxRequestIds.clear();
     reconnectAttempt = 0;
     sessionHeldBlocked = false;
@@ -2381,7 +2402,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (!mentionOwnerDetected && ctx.mode === "tui" && typeof ctx.ui?.addAutocompleteProvider === "function") {
       ctx.ui.addAutocompleteProvider((current) => createSessionMentionProvider(
         current,
-        () => listMentionPeers(true),
+        (scope) => listMentionPeersForMenu(scope),
         (message) => { if (getLiveContext()) ctx.ui.setStatus("intercom-mentions", message); },
         (token, binding) => { selectedMentions.set(token, binding); },
         () => !mentionOwnerDetected,
@@ -2396,9 +2417,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     try {
       const mentions = extractSessionMentions(event.text);
       if (mentions.length === 0) return { action: "continue" };
-      const peers = await listMentionPeers();
+      const rosters = new Map<MentionScope, SessionInfo[]>();
+      for (const scope of new Set(mentions.map((mention) => mention.scope))) rosters.set(scope, await listMentionPeers(scope));
       if (mentionOwnerDetected || !getLiveContext(ctx, generation)) return { action: "continue" };
-      const targets = resolveSessionMentions(mentions, peers, selectedMentions);
+      const targets = resolveSessionMentions(mentions, (scope) => rosters.get(scope) ?? [], selectedMentions);
       pendingMentionPrompts.push({ text: event.text, prompt: notificationPrompt(event.text, targets), createdAt: Date.now() });
       return { action: "continue" };
     } catch (error) {
@@ -2454,7 +2476,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     selectedMentions.clear();
     pendingMentionPrompts.length = 0;
     mentionPrompts.clear();
-    mentionCache = null;
+    mentionCaches.clear();
     clearStartupConnectTimer();
     clearReconnectTimer();
     clearNamePollTimer();
@@ -2865,7 +2887,7 @@ Usage:
         description: "Action: 'list', 'list-cwd', 'send', 'notify', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'notify' sends an AI-composed new message to an exact session ID, without inferring a reply. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
       }),
       global: Type.Optional(Type.Boolean({
-        description: "Only for list/list-cwd: include all local sessions across Herdr workspaces. Explicit send/notify/ask/reply/handover targets always resolve globally without this flag.",
+        description: "Only for list/list-cwd: include all local sessions across Herdr workspaces. Explicit send/notify/ask/reply/handover targets always resolve globally without this flag; an explicit false is treated as absent, while true on any other action is refused.",
       })),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). 'notify' requires an exact session ID. For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
@@ -2922,7 +2944,10 @@ Usage:
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
       const { action, to, message, targetEpoch, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
-      if (params.global !== undefined && action !== "list" && action !== "list-cwd") {
+      // Native tool callers can repeat every optional field with an empty default; `global: false`
+      // means "not enabled" and must not trip the list-only guard. Any other explicit value,
+      // including `true`, is still refused for every non-list action before delivery.
+      if (params.global !== undefined && params.global !== false && action !== "list" && action !== "list-cwd") {
         return { content: [{ type: "text", text: "global is only supported by list/list-cwd; messaging resolves globally without it." }], details: { error: true } };
       }
       if (targetEpoch !== undefined && action !== "notify") {

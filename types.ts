@@ -66,6 +66,10 @@ export interface SessionInfo {
   /** Present on list responses. `current` is freshly resolved for that request;
    *  other states explicitly distinguish non-Herdr sessions from failures. */
   herdrLocation?: HerdrLocation;
+  /** Client-resolved Herdr Agent label (`display_agent`, else the CLI kind). Display
+   *  only: the broker never projects or accepts it, and it is read from the live
+   *  Herdr roster rather than inferred from the session title. */
+  agentLabel?: string;
 }
 
 export type SessionHolder = Pick<SessionInfo, "pid" | "cwd" | "name">;
@@ -145,7 +149,7 @@ export interface ExtensionCapability {
   ownerEligible: boolean;
 }
 
-export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal" | "herdrLocation"> & {
+export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal" | "herdrLocation" | "agentLabel"> & {
   extensions?: ExtensionCapability[];
   /** Broker-only join hint; never returned in the public roster. */
   herdrSessionPath?: string;
