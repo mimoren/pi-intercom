@@ -3510,7 +3510,7 @@ test("on Pi 1.2.0 and newer, idle sessions wake through triggerTurn without a wa
   }
 });
 
-test("a noWake send reaches an idle session without starting a turn", { concurrency: false }, async () => {
+test("explicit broker noWake stays quiet and the Pi send tool cannot suppress waking", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, orchestrator, cleanup } = await setupClients();
   // The noWake check runs before the version-specific wake paths; Pi 1.1.0's extra wake prompt makes a stray wake visible.
@@ -3531,12 +3531,16 @@ test("a noWake send reaches an idle session without starting a turn", { concurre
     await waitForCondition(() => harness.userMessages.length === 1, "a normal message still wakes");
 
     const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
-    for (const noWake of [true, false]) {
-      const received = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
-      const result = await intercomTool.execute(`no-wake-${noWake}`, { action: "send", to: "orchestrator", message: "fyi", noWake }, new AbortController().signal, undefined, harness.ctx);
-      assert.notEqual(result.details?.error, true);
-      assert.equal((await received)[1].noWake, noWake ? true : undefined);
-    }
+    assert.doesNotMatch(JSON.stringify(intercomTool.parameters), /"noWake"/);
+    const received = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    const result = await intercomTool.execute("stale-no-wake", {
+      action: "send",
+      to: "orchestrator",
+      message: "Waiting for evidence",
+      noWake: true,
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(result.details?.error, true);
+    assert.equal((await received)[1].noWake, undefined);
   } finally {
     await harness.emitLifecycle("session_shutdown");
     await cleanup();

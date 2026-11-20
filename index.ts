@@ -97,7 +97,6 @@ interface DeliveryRequest {
   /** Explicit workspace notifications never infer a reply target. */
   notification?: boolean;
   targetEpoch?: string;
-  noWake?: boolean;
 }
 
 interface IntercomToolResult {
@@ -175,7 +174,7 @@ function triggerTurnRunsPromptLifecycle(piVersion: string): boolean {
 }
 
 export function explicitCrossMachineSendRestriction(
-  options: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing" | "replyTo" | "supersedes" | "retryOf" | "noWake"> & { attachments?: readonly unknown[] },
+  options: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing" | "replyTo" | "supersedes" | "retryOf"> & { attachments?: readonly unknown[] },
 ): string | undefined {
   if (!options.to?.includes("@")) return undefined;
   if (options.cwd || options.openProjectPaneIfMissing) {
@@ -183,9 +182,6 @@ export function explicitCrossMachineSendRestriction(
   }
   if (options.replyTo || options.supersedes || options.retryOf || options.attachments?.length) {
     return "Cross-machine send only supports a new text message; attachments, reply relationships, supersede, and retry are not supported.";
-  }
-  if (options.noWake) {
-    return "Cross-machine send does not support noWake; the receiver always wakes. Send it without noWake.";
   }
   return undefined;
 }
@@ -1990,7 +1986,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     signal: AbortSignal | undefined,
     request: DeliveryRequest,
   ): Promise<IntercomToolResult> {
-    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, noWake } = request;
+    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf } = request;
     try {
       let notificationTarget: SessionInfo | undefined;
       if (request.notification) {
@@ -2006,7 +2002,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       }
       const crossMachineTarget = Boolean(to?.includes("@"));
       const crossMachineRestriction = explicitCrossMachineSendRestriction({
-        to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf, noWake,
+        to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf,
       });
       if (crossMachineRestriction) {
         return {
@@ -2133,7 +2129,6 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         supersedes,
         retryOf,
         // A reply, explicit or inferred, answers a waiting asker, so it always wakes.
-        ...(noWake && !effectiveReplyTo ? { noWake: true } : {}),
       }));
       if (!result.delivered) {
         if (effectiveReplyTo && isClosedAskReply(result)) {
@@ -2868,8 +2863,7 @@ Usage:
   intercom({ action: "list", global: true })      → List all local sessions; cross-workspace messaging needs no flag
   intercom({ action: "list-cwd" })                → List sessions in the current working directory
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
-  intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
-  intercom({ action: "send", to: "name-or-id", message: "...", noWake: true }) → Information only: an idle receiver reads it on its next turn instead of starting one
+  intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message using the recipient's wake policy
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "notify", to: "exact-session-id", message: "contextual notification" }) → Send a new notification without replying to a pending ask
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
@@ -2925,9 +2919,6 @@ Usage:
       focus: Type.Optional(Type.Boolean({
         description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
       })),
-      noWake: Type.Optional(Type.Boolean({
-        description: "For 'send' only: true delivers the message without starting a turn in an idle receiver; it reads the message on its next turn. Use for information that needs no action or reply. Ignored when the send is a reply to an ask.",
-      })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2943,7 +2934,7 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, targetEpoch, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
+      const { action, to, message, targetEpoch, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
       // Native tool callers can repeat every optional field with an empty default; `global: false`
       // means "not enabled" and must not trip the list-only guard. Any other explicit value,
       // including `true`, is still refused for every non-list action before delivery.
@@ -3070,8 +3061,8 @@ Usage:
         }
 
         case "notify": {
-          if (!to || !message?.trim() || (targetEpoch !== undefined && (typeof targetEpoch !== "string" || !targetEpoch.trim())) || cwd || openProjectPaneIfMissing || replyTo || supersedes || retryOf || attachments?.length || noWake) {
-            return { content: [{ type: "text", text: "notify requires an exact session ID and a composed message; routing, reply, attachment and noWake options are not supported." }], details: { error: true } };
+          if (!to || !message?.trim() || (targetEpoch !== undefined && (typeof targetEpoch !== "string" || !targetEpoch.trim())) || cwd || openProjectPaneIfMissing || replyTo || supersedes || retryOf || attachments?.length) {
+            return { content: [{ type: "text", text: "notify requires an exact session ID and a composed message; routing, reply and attachment options are not supported." }], details: { error: true } };
           }
           return deliverMessage(connectedClient, ctx, _signal, { to, message, targetEpoch, notification: true });
         }
@@ -3083,7 +3074,7 @@ Usage:
             };
           }
           return deliverMessage(connectedClient, ctx, _signal, {
-            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, noWake,
+            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf,
           });
         }
 

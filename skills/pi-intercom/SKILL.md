@@ -25,6 +25,7 @@ intercom({ action: "reply", message, to? })        # answers an ask; `to` picks 
 
 ## Targeting
 
+- `send` and `notify` follow the recipient's wake policy, including for status updates and blockers.
 - `global` is only for `list`/`list-cwd`. Send, notify, ask, reply and handover resolve across local workspaces without any flag, including hidden siblings. The broker routing scope still applies.
 - `to` plus `cwd` uses the directory as a guard across all local workspaces.
 - `name@machine` or `<session-id>@machine` reaches a session on another machine: a saved Herdr machine, or any host `ssh machine` reaches without a prompt. Only `send` and `handover` work across machines: no `ask`, `replyTo`, attachments or `cwd`.

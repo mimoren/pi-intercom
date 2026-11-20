@@ -10,7 +10,6 @@ test("explicit cross-machine sends reject unsupported semantics before transport
     { retryOf: "message-1" },
     { cwd: "." },
     { openProjectPaneIfMissing: true },
-    { noWake: true },
   ];
   for (const extra of unsupported) {
     assert.match(
