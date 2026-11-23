@@ -419,7 +419,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     assert.deepEqual(registerMessages, [{
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1"],
+      features: ["extension-bus-v1", "exact-send-v1", "role-routing-v1"],
     }]);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {

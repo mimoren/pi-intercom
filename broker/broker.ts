@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkS
 import { join } from "path";
 import { createHash, randomUUID } from "crypto";
 import { writeMessage, createMessageReader, MAX_FRAME_BYTES } from "./framing.ts";
-import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration, messageDeliveryFingerprint } from "./protocol.ts";
+import { isMessage, isMessageReceipt, isRoleClaim, isSessionId, isSessionRegistration, messageDeliveryFingerprint } from "./protocol.ts";
 import {
   ensureIntercomRuntimeDir,
   getBrokerListenTarget,
@@ -18,8 +18,8 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs, getListLocationScope } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE } from "../types.ts";
-import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, ROLE_ROUTING_FEATURE, SESSION_HELD_ERROR_CODE } from "../types.ts";
+import type { DeliveryState, RoleClaim, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { filterSessionsByLocationScope, resolveHerdrLocations } from "../herdr-location.ts";
@@ -78,6 +78,8 @@ interface ConnectedSession {
    * is a self-asserted local-client hint, not authenticated location evidence. */
   herdrSessionPath?: string;
   acknowledgesReceipts: boolean;
+  /** Last role claim's producer revision, kept only to deduplicate repeated snapshots. */
+  roleRevision?: string;
   /** Heartbeat interval the client promised; absent for clients that never heartbeat. */
   livenessIntervalMs?: number;
   lastInboundAt: number;
@@ -188,6 +190,38 @@ function isProcessAlive(pid: number): boolean {
 
 function sameScope(a: string | undefined, b: string | undefined): boolean {
   return a === b;
+}
+
+/**
+ * Apply one presence role claim and rotate the broker-owned `roleEpoch` only
+ * when the routing identity actually changed. A repeated snapshot (same claim,
+ * same producer revision) is a no-op, so heartbeat-style resends never force a
+ * reselect; a producer reload of the same role changes `revision`, which does.
+ */
+function applyRolePresence(session: ConnectedSession, claim: unknown): boolean {
+  if (claim === null) {
+    if (session.info.role === undefined && session.info.roleEpoch === undefined) return false;
+    delete session.info.role;
+    delete session.info.roleEpoch;
+    delete session.roleRevision;
+    return true;
+  }
+  if (!isRoleClaim(claim)) throw new Error("Invalid presence role");
+  const previousRole: RoleClaim | undefined = session.info.role;
+  const identityChanged = previousRole?.id !== claim.id || (previousRole?.source ?? undefined) !== (claim.source ?? undefined);
+  const revisionChanged = claim.revision !== undefined && claim.revision !== session.roleRevision;
+  if (!identityChanged && !revisionChanged && session.info.roleEpoch !== undefined) {
+    // Same identity and same producer revision: keep the epoch so peers that
+    // pinned this role stay valid.
+    return false;
+  }
+  session.info.role = { id: claim.id, ...(claim.source !== undefined ? { source: claim.source } : {}) };
+  // A claim without a revision cannot be matched later, so it clears the token.
+  if (claim.revision !== undefined) session.roleRevision = claim.revision;
+  else delete session.roleRevision;
+  // A clear followed by the same role must not reuse an epoch an older pin holds.
+  session.info.roleEpoch = randomUUID();
+  return true;
 }
 
 function scopedSessionKey(scopeId: string | undefined, sessionId: string): string {
@@ -555,9 +589,16 @@ class IntercomBroker {
           previous.socket.end();
         }
         setKey(key);
+        const roleClaim = session.role;
         const info: SessionInfo = {
           id,
           endpointEpoch: randomUUID(),
+          ...(roleClaim
+            ? {
+                role: { id: roleClaim.id, ...(roleClaim.source !== undefined ? { source: roleClaim.source } : {}) },
+                roleEpoch: randomUUID(),
+              }
+            : {}),
           ...(session.name !== undefined ? { name: session.name } : {}),
           ...(session.runtimeFallbackAlias !== undefined ? { runtimeFallbackAlias: session.runtimeFallbackAlias } : {}),
           cwd: session.cwd,
@@ -581,6 +622,7 @@ class IntercomBroker {
           extensions,
           ...(session.herdrSessionPath ? { herdrSessionPath: session.herdrSessionPath } : {}),
           acknowledgesReceipts: session.acknowledgesReceipts === true,
+          ...(roleClaim?.revision !== undefined ? { roleRevision: roleClaim.revision } : {}),
           ...(session.livenessIntervalMs !== undefined ? { livenessIntervalMs: session.livenessIntervalMs } : {}),
           lastInboundAt: Date.now(),
         };
@@ -598,7 +640,7 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, ROLE_ROUTING_FEATURE],
         });
         this.broadcast({ type: "session_joined", session: info }, key, scopeId);
 
@@ -755,12 +797,15 @@ class IntercomBroker {
 
         const hasTargetId = clientMessage.targetId !== undefined;
         const hasTargetEpoch = clientMessage.targetEpoch !== undefined;
+        const hasTargetRoleEpoch = clientMessage.targetRoleEpoch !== undefined;
         if (
           hasTargetId !== hasTargetEpoch
+          || (hasTargetRoleEpoch && !(hasTargetId && hasTargetEpoch))
           || (hasTargetId && (typeof clientMessage.targetId !== "string" || clientMessage.targetId.length === 0))
           || (hasTargetEpoch && (typeof clientMessage.targetEpoch !== "string" || clientMessage.targetEpoch.length === 0))
+          || (hasTargetRoleEpoch && (typeof clientMessage.targetRoleEpoch !== "string" || clientMessage.targetRoleEpoch.length === 0))
         ) {
-          this.writeDeliveryFailure(socket, message.id, "Exact target requires an id and endpoint epoch", "E_INVALID_TARGET");
+          this.writeDeliveryFailure(socket, message.id, "Exact target requires an id and endpoint epoch; a role pin also needs both", "E_INVALID_TARGET");
           break;
         }
         if (hasTargetId && hasTargetEpoch) {
@@ -780,6 +825,21 @@ class IntercomBroker {
             this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
             this.writeDeliveryFailure(socket, message.id, "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
             break;
+          }
+          if (hasTargetRoleEpoch) {
+            const targetRoleEpoch = clientMessage.targetRoleEpoch as string;
+            // A role pin is never retried and never rewritten to another endpoint:
+            // the sender must reselect the role, so neither code is retryable.
+            if (exactTarget.info.roleEpoch === undefined) {
+              this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Target session reports no role identity", "E_ROLE_UNAVAILABLE");
+              this.writeDeliveryFailure(socket, message.id, "Target session reports no role identity; it may be an older client", "E_ROLE_UNAVAILABLE");
+              break;
+            }
+            if (exactTarget.info.roleEpoch !== targetRoleEpoch) {
+              this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Target role changed before delivery", "E_ROLE_CHANGED");
+              this.writeDeliveryFailure(socket, message.id, "Target role changed before delivery; select the recipient again", "E_ROLE_CHANGED");
+              break;
+            }
           }
           clientMessage.to = targetId;
         }
@@ -1077,6 +1137,9 @@ class IntercomBroker {
               session.info.contextWindow = clientMessage.contextWindow;
               changed = true;
             }
+          }
+          if (clientMessage.role !== undefined) {
+            if (applyRolePresence(session, clientMessage.role)) changed = true;
           }
           const now = Date.now();
           session.info.lastActivity = now;

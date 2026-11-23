@@ -5,9 +5,13 @@ import type {
   MessageProvenance,
   MessageReceipt,
   MessageReceiptStatus,
+  RoleClaim,
+  RoleIdentity,
   SessionInfo,
   SessionRegistration,
 } from "../types.ts";
+
+type RecordValue = Record<string, unknown>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -69,6 +73,20 @@ export function isMessageControl(value: unknown): value is MessageControl {
     return false;
   }
   return value.detail === undefined || typeof value.detail === "string";
+}
+
+function isRoleIdentity(value: unknown): value is RoleIdentity {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string"
+    && value.id.trim().length > 0
+    && (value.source === undefined || typeof value.source === "string");
+}
+
+/** A client role claim: identity plus an optional producer revision token. */
+export function isRoleClaim(value: unknown): value is RoleClaim {
+  if (!isRoleIdentity(value)) return false;
+  const revision = (value as RecordValue).revision;
+  return revision === undefined || (typeof revision === "string" && revision.trim().length > 0);
 }
 
 function isAttachment(value: unknown): value is Attachment {
@@ -236,6 +254,13 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
     return false;
   }
 
+  if (value.role !== undefined && !isRoleIdentity(value.role)) {
+    return false;
+  }
+  if (value.roleEpoch !== undefined && typeof value.roleEpoch !== "string") {
+    return false;
+  }
+
   return value.trustedLocal === undefined || typeof value.trustedLocal === "boolean";
 }
 
@@ -274,6 +299,9 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     return false;
   }
   if (value.herdrSessionPath !== undefined && typeof value.herdrSessionPath !== "string") {
+    return false;
+  }
+  if (value.role !== undefined && !isRoleClaim(value.role)) {
     return false;
   }
   if (value.acknowledgesReceipts !== undefined && typeof value.acknowledgesReceipts !== "boolean") {

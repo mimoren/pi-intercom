@@ -1,5 +1,7 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
+/** Broker maintains a per-session role revision and rejects role-pinned sends. */
+export const ROLE_ROUTING_FEATURE = "role-routing-v1";
 /** Broker refused a register because another live process holds the session id. */
 export const SESSION_HELD_ERROR_CODE = "E_SESSION_HELD";
 
@@ -70,6 +72,27 @@ export interface SessionInfo {
    *  only: the broker never projects or accepts it, and it is read from the live
    *  Herdr roster rather than inferred from the session title. */
   agentLabel?: string;
+  /** Active canonical role. Present only when the session reported one: a
+   *  session without it may be an older client or an initialized no-role
+   *  session, and neither may be read as the other. */
+  role?: RoleIdentity;
+  /** Broker-owned revision of `role`. A role-pinned send compares it, so a
+   *  switch, clear, or producer reload that changes it must be reselected.
+   *  Reconnects do not change it; `endpointEpoch` already covers those. */
+  roleEpoch?: string;
+}
+
+/** Canonical role id plus the source that tells two same-named definitions apart. */
+export interface RoleIdentity {
+  id: string;
+  source?: string;
+}
+
+/** A client's role claim. `revision` identifies the producer instance and the
+ *  generation within it, so a repeated snapshot can be deduplicated while a
+ *  reload of the same role still rotates the broker's `roleEpoch`. */
+export interface RoleClaim extends RoleIdentity {
+  revision?: string;
 }
 
 export type SessionHolder = Pick<SessionInfo, "pid" | "cwd" | "name">;
@@ -149,7 +172,9 @@ export interface ExtensionCapability {
   ownerEligible: boolean;
 }
 
-export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal" | "herdrLocation" | "agentLabel"> & {
+export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal" | "herdrLocation" | "agentLabel" | "role" | "roleEpoch"> & {
+  /** Omitted when the client cannot report a role (older client, unknown identity). */
+  role?: RoleClaim;
   extensions?: ExtensionCapability[];
   /** Broker-only join hint; never returned in the public roster. */
   herdrSessionPath?: string;
@@ -164,11 +189,11 @@ export type ClientMessage =
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string; locationScope?: "workspace" | "machine" }
-  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string }
+  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string; targetRoleEpoch?: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
   | { type: "cancel_ask"; messageId: string }
-  | { type: "presence"; name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }
+  | { type: "presence"; name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null; role?: RoleClaim | null }
   | {
       type: "extension_publish";
       namespace: string;

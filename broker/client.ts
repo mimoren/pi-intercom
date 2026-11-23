@@ -5,7 +5,7 @@ import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
 import { getIntercomScopeId } from "../config.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE, type DeliveryDetails } from "../types.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, ROLE_ROUTING_FEATURE, SESSION_HELD_ERROR_CODE, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -15,6 +15,7 @@ import type {
   MessageControl,
   MessageProvenance,
   MessageReceipt,
+  RoleClaim,
   SessionInfo,
   SessionHolder,
   SessionRegistration,
@@ -29,6 +30,9 @@ interface SendOptions {
   messageId?: string;
   /** Pin a previously validated live endpoint; never fall back to offline mail or a rebound endpoint. */
   targetEpoch?: string;
+  /** Also pin the target's role revision. Requires `targetEpoch`, and a broker with
+   *  role routing: an older broker would ignore it and deliver anyway. */
+  targetRoleEpoch?: string;
   supersedes?: string;
   retryOf?: string;
   provenance?: MessageProvenance;
@@ -664,7 +668,7 @@ export class IntercomClient extends EventEmitter {
       },
     };
 
-    const sendOnce = (targetId?: string, targetEpoch?: string): Promise<SendResult> => new Promise((resolve, reject) => {
+    const sendOnce = (targetId?: string, targetEpoch?: string, targetRoleEpoch?: string): Promise<SendResult> => new Promise((resolve, reject) => {
       const wrappedResolve = (result: SendResult) => {
         clearTimeout(timeout);
         resolve(result);
@@ -682,7 +686,7 @@ export class IntercomClient extends EventEmitter {
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
-        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}) });
+        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch, ...(targetRoleEpoch ? { targetRoleEpoch } : {}) } : {}) });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingSends.delete(messageId);
@@ -690,6 +694,13 @@ export class IntercomClient extends EventEmitter {
       }
     });
 
+    if (options.targetRoleEpoch) {
+      // Older brokers ignore an unknown role pin and would deliver to a switched
+      // role, so the refusal has to happen before this frame is written.
+      if (!this.supportsFeature(ROLE_ROUTING_FEATURE)) throw new Error("Broker does not support role-pinned delivery. Upgrade the broker before sending collaboration requests.");
+      if (!options.targetEpoch) throw new Error("Role-pinned delivery requires the target endpoint epoch.");
+      return sendOnce(to, options.targetEpoch, options.targetRoleEpoch);
+    }
     if (options.targetEpoch) {
       if (!this.supportsFeature(EXACT_SEND_FEATURE)) throw new Error("Broker does not support pinned endpoint delivery. Upgrade the broker before sending notifications.");
       return sendOnce(to, options.targetEpoch);
@@ -781,13 +792,20 @@ export class IntercomClient extends EventEmitter {
     }
   }
 
-  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }): void {
+  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null; role?: RoleClaim | null }): void {
     if (this.disconnecting) {
       return;
     }
 
     const socket = this.socket;
     if (!socket || !this._sessionId || socket.destroyed || socket.writableEnded || !socket.writable) {
+      return;
+    }
+    if (updates.role !== undefined && updates.role !== null && !this.supportsFeature(ROLE_ROUTING_FEATURE)) {
+      // Reporting a role to a broker that does not track one would advertise an
+      // identity it cannot enforce, so drop it instead of sending it.
+      const { role: _ignored, ...withoutRole } = updates;
+      writeMessage(socket, { type: "presence", ...withoutRole });
       return;
     }
 
