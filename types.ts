@@ -74,12 +74,19 @@ export interface SessionInfo {
   agentLabel?: string;
   /** Active canonical role. Present only when the session reported one: a
    *  session without it may be an older client or an initialized no-role
-   *  session, and neither may be read as the other. */
+   *  session, so read `roleState` before treating a missing role as "no role". */
   role?: RoleIdentity;
   /** Broker-owned revision of `role`. A role-pinned send compares it, so a
    *  switch, clear, or producer reload that changes it must be reselected.
-   *  Reconnects do not change it; `endpointEpoch` already covers those. */
+   *  Reconnects do not preserve it; `endpointEpoch` already covers those. */
   roleEpoch?: string;
+  /** What this session said about its role capability.
+   *  - absent: unknown. The session never reported (older client, or no answer yet).
+   *  - `no_role`: it is initialized and confirms it has no active role.
+   *  - `active`: `role` and `roleEpoch` are present and routable.
+   *  Unknown and `no_role` must never be collapsed: one is missing evidence,
+   *  the other is a definite answer. */
+  roleState?: "no_role" | "active";
 }
 
 /** Canonical role id plus the source that tells two same-named definitions apart. */
@@ -172,9 +179,10 @@ export interface ExtensionCapability {
   ownerEligible: boolean;
 }
 
-export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal" | "herdrLocation" | "agentLabel" | "role" | "roleEpoch"> & {
-  /** Omitted when the client cannot report a role (older client, unknown identity). */
-  role?: RoleClaim;
+export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal" | "herdrLocation" | "agentLabel" | "role" | "roleEpoch" | "roleState"> & {
+  /** Omitted when the client cannot report a role (older client, unknown identity).
+   *  `null` is a definite answer: this session is initialized and has no role. */
+  role?: RoleClaim | null;
   extensions?: ExtensionCapability[];
   /** Broker-only join hint; never returned in the public roster. */
   herdrSessionPath?: string;

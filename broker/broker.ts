@@ -197,20 +197,22 @@ function sameScope(a: string | undefined, b: string | undefined): boolean {
  * when the routing identity actually changed. A repeated snapshot (same claim,
  * same producer revision) is a no-op, so heartbeat-style resends never force a
  * reselect; a producer reload of the same role changes `revision`, which does.
+ * `null` is a definite answer (initialized, no role), not an absent one.
  */
 function applyRolePresence(session: ConnectedSession, claim: unknown): boolean {
   if (claim === null) {
-    if (session.info.role === undefined && session.info.roleEpoch === undefined) return false;
+    if (session.info.roleState === "no_role") return false;
     delete session.info.role;
     delete session.info.roleEpoch;
     delete session.roleRevision;
+    session.info.roleState = "no_role";
     return true;
   }
   if (!isRoleClaim(claim)) throw new Error("Invalid presence role");
   const previousRole: RoleClaim | undefined = session.info.role;
   const identityChanged = previousRole?.id !== claim.id || (previousRole?.source ?? undefined) !== (claim.source ?? undefined);
   const revisionChanged = claim.revision !== undefined && claim.revision !== session.roleRevision;
-  if (!identityChanged && !revisionChanged && session.info.roleEpoch !== undefined) {
+  if (!identityChanged && !revisionChanged && session.info.roleEpoch !== undefined && session.info.roleState === "active") {
     // Same identity and same producer revision: keep the epoch so peers that
     // pinned this role stay valid.
     return false;
@@ -221,7 +223,19 @@ function applyRolePresence(session: ConnectedSession, claim: unknown): boolean {
   else delete session.roleRevision;
   // A clear followed by the same role must not reuse an epoch an older pin holds.
   session.info.roleEpoch = randomUUID();
+  session.info.roleState = "active";
   return true;
+}
+
+/** Registration starts from the same three-state contract as a later presence. */
+function initialRoleFields(claim: RoleClaim | null | undefined): Partial<SessionInfo> {
+  if (claim === null) return { roleState: "no_role" };
+  if (claim === undefined) return {};
+  return {
+    role: { id: claim.id, ...(claim.source !== undefined ? { source: claim.source } : {}) },
+    roleEpoch: randomUUID(),
+    roleState: "active",
+  };
 }
 
 function scopedSessionKey(scopeId: string | undefined, sessionId: string): string {
@@ -593,12 +607,7 @@ class IntercomBroker {
         const info: SessionInfo = {
           id,
           endpointEpoch: randomUUID(),
-          ...(roleClaim
-            ? {
-                role: { id: roleClaim.id, ...(roleClaim.source !== undefined ? { source: roleClaim.source } : {}) },
-                roleEpoch: randomUUID(),
-              }
-            : {}),
+          ...initialRoleFields(roleClaim),
           ...(session.name !== undefined ? { name: session.name } : {}),
           ...(session.runtimeFallbackAlias !== undefined ? { runtimeFallbackAlias: session.runtimeFallbackAlias } : {}),
           cwd: session.cwd,
@@ -622,7 +631,7 @@ class IntercomBroker {
           extensions,
           ...(session.herdrSessionPath ? { herdrSessionPath: session.herdrSessionPath } : {}),
           acknowledgesReceipts: session.acknowledgesReceipts === true,
-          ...(roleClaim?.revision !== undefined ? { roleRevision: roleClaim.revision } : {}),
+          ...(roleClaim && roleClaim.revision !== undefined ? { roleRevision: roleClaim.revision } : {}),
           ...(session.livenessIntervalMs !== undefined ? { livenessIntervalMs: session.livenessIntervalMs } : {}),
           lastInboundAt: Date.now(),
         };

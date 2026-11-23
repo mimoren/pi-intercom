@@ -686,7 +686,7 @@ export class IntercomClient extends EventEmitter {
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
-        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch, ...(targetRoleEpoch ? { targetRoleEpoch } : {}) } : {}) });
+        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch, ...(targetRoleEpoch !== undefined ? { targetRoleEpoch } : {}) } : {}) });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingSends.delete(messageId);
@@ -694,11 +694,14 @@ export class IntercomClient extends EventEmitter {
       }
     });
 
-    if (options.targetRoleEpoch) {
-      // Older brokers ignore an unknown role pin and would deliver to a switched
-      // role, so the refusal has to happen before this frame is written.
+    if (options.targetRoleEpoch !== undefined) {
+      // Presence, not truthiness: an explicit empty string is a caller mistake and
+      // must fail here, not quietly turn into an ordinary endpoint or alias send.
+      // Older brokers also ignore an unknown role pin and would deliver to a
+      // switched role, so both refusals happen before this frame is written.
       if (!this.supportsFeature(ROLE_ROUTING_FEATURE)) throw new Error("Broker does not support role-pinned delivery. Upgrade the broker before sending collaboration requests.");
       if (!options.targetEpoch) throw new Error("Role-pinned delivery requires the target endpoint epoch.");
+      if (options.targetRoleEpoch.trim().length === 0) throw new Error("Role-pinned delivery requires a non-empty target role epoch.");
       return sendOnce(to, options.targetEpoch, options.targetRoleEpoch);
     }
     if (options.targetEpoch) {

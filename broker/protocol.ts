@@ -260,6 +260,13 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   if (value.roleEpoch !== undefined && typeof value.roleEpoch !== "string") {
     return false;
   }
+  if (value.roleState !== undefined) {
+    if (value.roleState !== "no_role" && value.roleState !== "active") return false;
+    // The three states carry their own invariants: a definite `no_role` cannot
+    // also expose an identity, and `active` is not usable without one.
+    if (value.roleState === "no_role" && (value.role !== undefined || value.roleEpoch !== undefined)) return false;
+    if (value.roleState === "active" && (value.role === undefined || typeof value.roleEpoch !== "string")) return false;
+  }
 
   return value.trustedLocal === undefined || typeof value.trustedLocal === "boolean";
 }
@@ -301,7 +308,7 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
   if (value.herdrSessionPath !== undefined && typeof value.herdrSessionPath !== "string") {
     return false;
   }
-  if (value.role !== undefined && !isRoleClaim(value.role)) {
+  if (value.role !== undefined && value.role !== null && !isRoleClaim(value.role)) {
     return false;
   }
   if (value.acknowledgesReceipts !== undefined && typeof value.acknowledgesReceipts !== "boolean") {
