@@ -24,7 +24,7 @@ import type { DeliveryState, RoleClaim, SessionInfo, Message, BrokerMessage, Ext
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { filterSessionsByLocationScope, resolveHerdrLocations } from "../herdr-location.ts";
-import { approveRoleConsultation, CONSULT_BUDGET, CONSULT_TTL_MS, ROLE_CONSULT_FEATURE, validConsultId, type ConsultGrant } from "../role-consult.ts";
+import { ROLE_CONSULT_FEATURE, validConsultId } from "../role-consult.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -295,8 +295,6 @@ function ensurePendingAskRecordDir(): void {
 }
 
 export class IntercomBroker {
-  private roleGrants = new WeakMap<ConnectedSession, ConsultGrant>();
-  private pendingRoleApproval: { session: ConnectedSession; cancelled: boolean } | undefined;
   private sessions = new Map<string, ConnectedSession>();
   private askEdges = new Map<string, AskEdge>();
   private messageReceiptRoutes = new Map<string, MessageReceiptRoute>();
@@ -314,7 +312,7 @@ export class IntercomBroker {
   private nextOwnerOrder = 1;
   private extensionStateManager: ExtensionStateManager;
 
-  constructor(private readonly authenticateOwner = approveRoleConsultation) {
+  constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
@@ -516,46 +514,12 @@ export class IntercomBroker {
     return resolveHerdrLocations(sessions.map(({ info }) => info), { sessionPaths });
   }
 
-  private async changeRoleGrant(socket: net.Socket, key: string, owner: ConnectedSession, request: Record<string, unknown>): Promise<void> {
-    const { requestId, taskId, roleId } = request;
-    if (!validConsultId(requestId)) return;
-    if (taskId === undefined && roleId === undefined) {
-      this.roleGrants.delete(owner);
-      if (this.pendingRoleApproval?.session === owner) this.pendingRoleApproval.cancelled = true;
-      this.writeDeliverySuccess(socket, requestId, "socket_delivered");
-      return;
-    }
-    if (!validConsultId(taskId) || !validConsultId(roleId) || !owner.info.trustedLocal || !owner.info.endpointEpoch || this.pendingRoleApproval) {
-      this.writeDeliveryFailure(socket, requestId, "Invalid consultation scope or an owner confirmation is already pending", "E_ROLE_GRANT");
-      return;
-    }
-    const approval = { session: owner, cancelled: false };
-    this.pendingRoleApproval = approval;
-    const replyDenied = () => this.writeDeliveryFailure(socket, requestId, "Owner confirmation or live workspace could not be verified", "E_ROLE_GRANT");
-    try {
-      const [before] = await this.liveLocations(owner);
-      const location = before?.herdrLocation;
-      if (location?.status !== "current") return replyDenied();
-      const scope = { taskId, roleId, workspaceId: location.workspace.id };
-      const cwd = owner.info.cwd;
-      if (!await this.authenticateOwner(scope, cwd, owner.info.id)) return replyDenied();
-      const [after] = await this.liveLocations(owner);
-      if (approval.cancelled || this.sessions.get(key) !== owner || owner.info.cwd !== cwd || after?.herdrLocation?.status !== "current" || after.herdrLocation.workspace.id !== scope.workspaceId) return replyDenied();
-      this.roleGrants.set(owner, { ...scope, ownerEpoch: owner.info.endpointEpoch, cwd, expiresAt: Date.now() + CONSULT_TTL_MS, remaining: CONSULT_BUDGET });
-      this.writeDeliverySuccess(socket, requestId, "socket_delivered");
-    } catch {
-      if (!socket.destroyed) replyDenied();
-    } finally {
-      this.pendingRoleApproval = undefined;
-    }
-  }
-
   private handleMessage(
     socket: net.Socket,
     msg: unknown,
     currentKey: string | null,
     setKey: (key: string | null) => void,
-    verifiedConsultation?: { owner: ConnectedSession; target: ConnectedSession; grant: ConsultGrant },
+    verifiedConsultation?: { sender: ConnectedSession; target: ConnectedSession },
   ): void {
     if (typeof msg !== "object" || msg === null || !("type" in msg) || typeof msg.type !== "string") {
       throw new Error("Invalid client message");
@@ -824,13 +788,6 @@ export class IntercomBroker {
         break;
       }
 
-      case "role_grant": {
-        if (!currentKey) throw new Error("Role grant requested before register");
-        const owner = this.sessions.get(currentKey);
-        if (owner?.socket === socket) void this.changeRoleGrant(socket, currentKey, owner, clientMessage);
-        break;
-      }
-
       case "send": {
         if (!currentKey) {
           throw new Error("Received send before register");
@@ -909,32 +866,27 @@ export class IntercomBroker {
           }
           if (clientMessage.consultation !== undefined) {
             const scope = clientMessage.consultation as Record<string, unknown> | null;
-            const grant = this.roleGrants.get(fromSession);
-            const permitted = scope && typeof scope === "object" && grant && hasTargetRoleEpoch
-              && scope.taskId === grant.taskId && scope.workspaceId === grant.workspaceId
-              && grant.ownerEpoch === fromSession.info.endpointEpoch && grant.expiresAt > Date.now() && grant.remaining > 0
-              && exactTarget.info.role?.id === grant.roleId && sameCwd(exactTarget.info.cwd, grant.cwd)
-              && message.expectsReply === true && !message.replyTo && !message.crossMachine && !message.supersedes;
-            if (!permitted || !grant) {
-              this.writeDeliveryFailure(socket, message.id, "No active grant for this read-only consultation", "E_ROLE_GRANT");
+            if (!scope || typeof scope !== "object" || !validConsultId(scope.taskId) || !validConsultId(scope.workspaceId)
+              || !hasTargetRoleEpoch || exactTarget === fromSession || message.expectsReply !== true || message.replyTo || message.crossMachine || message.supersedes) {
+              this.writeDeliveryFailure(socket, message.id, "Consultation requires a task ID, selected workspace, exact role and a new question", "E_INVALID_TARGET");
               break;
             }
             if (!verifiedConsultation) {
-              void this.liveLocations(fromSession, exactTarget).then(([owner, target]) => {
+              void this.liveLocations(fromSession, exactTarget).then(([sender, target]) => {
                 const workspace = (row?: SessionInfo) => row?.herdrLocation?.status === "current" ? row.herdrLocation.workspace.id : undefined;
                 if (socket.destroyed) return;
-                if (workspace(owner) !== grant.workspaceId || workspace(target) !== grant.workspaceId) {
-                  this.writeDeliveryFailure(socket, message.id, "Consultation requires both sessions in the approved workspace", "E_ROLE_WORKSPACE");
+                if (workspace(sender) !== scope.workspaceId || workspace(target) !== scope.workspaceId) {
+                  this.writeDeliveryFailure(socket, message.id, "Consultation requires both sessions in the selected workspace", "E_ROLE_WORKSPACE");
                   return;
                 }
-                this.handleMessage(socket, clientMessage, currentKey, setKey, { owner: fromSession, target: exactTarget, grant });
+                this.handleMessage(socket, clientMessage, currentKey, setKey, { sender: fromSession, target: exactTarget });
               }).catch(() => {
                 if (!socket.destroyed) this.writeDeliveryFailure(socket, message.id, "Current workspace could not be verified", "E_ROLE_WORKSPACE");
               });
               break;
             }
-            if (verifiedConsultation.owner !== fromSession || verifiedConsultation.target !== exactTarget || verifiedConsultation.grant !== grant) {
-              this.writeDeliveryFailure(socket, message.id, "Consultation authorization or endpoint changed", "E_ROLE_GRANT");
+            if (verifiedConsultation.sender !== fromSession || verifiedConsultation.target !== exactTarget) {
+              this.writeDeliveryFailure(socket, message.id, "Consultation endpoint changed", "E_TARGET_REBOUND");
               break;
             }
           }
@@ -980,7 +932,6 @@ export class IntercomBroker {
               createdAt: brokerReceivedAt,
             });
           }
-          if (verifiedConsultation) verifiedConsultation.grant.remaining -= 1;
           const deliveredMessage: Message = {
             ...message,
             brokerReceivedAt,

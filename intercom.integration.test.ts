@@ -419,7 +419,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     assert.deepEqual(registerMessages, [{
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1", "role-routing-v1", "role-consult-v1"],
+      features: ["extension-bus-v1", "exact-send-v1", "role-routing-v1", "role-consult-task-v1"],
     }]);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
@@ -430,11 +430,8 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
   }
 });
 
-async function setupClients(authenticateOwner?: boolean) {
-  const brokerArgs = authenticateOwner === undefined
-    ? [path.join(repoDir, "broker", "broker.ts")]
-    : ["--input-type=module", "-e", `import { IntercomBroker } from './broker/broker.ts'; new IntercomBroker(async () => ${authenticateOwner}).start();`];
-  const broker = spawn(process.execPath, [...tsxImportArgs, ...brokerArgs], {
+async function setupClients() {
+  const broker = spawn(process.execPath, [...tsxImportArgs, path.join(repoDir, "broker", "broker.ts")], {
     cwd: repoDir,
     env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
     stdio: ["ignore", "pipe", "pipe"],
@@ -6573,7 +6570,7 @@ test("registered inline renderer follows real CustomMessageComponent rebuild and
   }
 });
 
-test("an owner grant permits a same-workspace cross-tab role consultation and can be revoked", { concurrency: false, skip: process.platform === "win32" }, async () => {
+test("a task consultation routes directly across tabs in one workspace", { concurrency: false, skip: process.platform === "win32" }, async () => {
   const root = mkdtempSync(path.join(tmpdir(), "pi-intercom-consult-"));
   const fixture = path.join(root, "herdr-fixture");
   const topology = path.join(root, "snapshot.json");
@@ -6597,7 +6594,7 @@ test("an owner grant permits a same-workspace cross-tab role consultation and ca
     chmodSync(fixture, 0o755);
     setTopology("test-workspace");
     await withEnv("HERDR_BIN", fixture, async () => {
-      const setup = await setupClients(true);
+      const setup = await setupClients();
       try {
         const base = { cwd: main, model: "test", pid: process.pid, startedAt: 1, lastActivity: 1 };
         await author.connect({ ...base, name: "wtdog", herdrPaneId: "author-pane", role: { id: "wtdog" } }, "wtdog-fixture");
@@ -6607,9 +6604,8 @@ test("an owner grant permits a same-workspace cross-tab role consultation and ca
         const options = { text: "Confirm checkout, branch, tag and commit", expectsReply: true, targetEpoch: target.endpointEpoch, targetRoleEpoch: target.roleEpoch, consultation: scope };
         let deliveries = 0;
         peer.on("message", () => deliveries++);
-        assert.equal((await author.send(target.id, options)).code, "E_ROLE_GRANT");
+        assert.equal((await author.send(target.id, { ...options, consultation: { ...scope, taskId: "" } })).code, "E_INVALID_TARGET");
         assert.equal(deliveries, 0);
-        assert.equal((await author.changeRoleGrant({ taskId: scope.taskId, roleId: "wtree" })).delivered, true);
         setTopology("other-workspace");
         assert.equal((await author.send(target.id, options)).code, "E_ROLE_WORKSPACE");
         assert.equal(deliveries, 0);
@@ -6634,21 +6630,10 @@ test("an owner grant permits a same-workspace cross-tab role consultation and ca
         peer.updatePresence({ role: { id: "release" } });
         await waitForCondition(async () => (await author.listSessions({ global: true })).find((row) => row.id === target.id)?.role?.id === "release", "role changed");
         assert.equal((await author.send(target.id, options)).code, "E_ROLE_CHANGED");
-        peer.updatePresence({ role: { id: "wtree" } });
-        await waitForCondition(async () => (await author.listSessions({ global: true })).find((row) => row.id === target.id)?.role?.id === "wtree", "role restored");
-        const current = (await author.listSessions({ global: true })).find((row) => row.id === target.id)!;
-        const next = { ...options, targetRoleEpoch: current.roleEpoch };
-        for (let index = 0; index < 9; index++) {
-          const sent = await author.send(target.id, next);
-          assert.equal(sent.delivered, true);
-          await author.cancelAsk(sent.id);
-        }
-        assert.equal((await author.send(target.id, next)).code, "E_ROLE_GRANT");
-        assert.equal(deliveries, 10);
-        assert.equal((await author.changeRoleGrant({ taskId: scope.taskId, roleId: "wtree" })).delivered, true);
-        assert.equal((await author.changeRoleGrant()).delivered, true);
-        assert.equal((await author.send(target.id, next)).code, "E_ROLE_GRANT");
-        assert.equal(deliveries, 10);
+        await peer.disconnect();
+        await peer.connect({ ...base, name: "wtree", herdrPaneId: "peer-pane", role: { id: "wtree" } }, target.id);
+        assert.equal((await author.send(target.id, options)).code, "E_TARGET_REBOUND");
+        assert.equal(deliveries, 1);
       } finally {
         await Promise.all([author.disconnect(), peer.disconnect()]);
         await setup.cleanup();

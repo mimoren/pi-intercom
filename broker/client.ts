@@ -644,18 +644,12 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
-  changeRoleGrant(scope?: { taskId: string; roleId: string }): Promise<SendResult> {
-    if (!this.supportsFeature(ROLE_CONSULT_FEATURE)) return Promise.reject(new Error("Broker does not support consultation grants"));
-    const requestId = randomUUID();
-    return this.requestDelivery(this.requireActiveSocket(), requestId, { type: "role_grant", requestId, ...scope }, 55_000);
-  }
-
-  private requestDelivery(socket: net.Socket, messageId: string, frame: ClientMessage, timeoutMs = 10_000): Promise<SendResult> {
+  private requestDelivery(socket: net.Socket, messageId: string, frame: ClientMessage): Promise<SendResult> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingSends.delete(messageId);
         reject(new Error("Delivery request timeout"));
-      }, timeoutMs);
+      }, 10_000);
       this.pendingSends.set(messageId, {
         resolve: (result) => { clearTimeout(timeout); resolve(result); },
         reject: (error) => { clearTimeout(timeout); reject(error); },

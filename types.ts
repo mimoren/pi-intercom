@@ -197,7 +197,6 @@ export type ClientMessage =
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string; locationScope?: "workspace" | "machine" }
-  | { type: "role_grant"; requestId: string; taskId?: string; roleId?: string }
   | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string; targetRoleEpoch?: string; consultation?: { taskId: string; workspaceId: string } }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
