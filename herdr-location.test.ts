@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { filterSessionsByLocationScope, paneAgentLabel, resolveHerdrAgentLabels, resolveHerdrLocations } from "./herdr-location.ts";
+import { filterSessionsByLocationScope, listRoleWorkspacePanes, paneAgentLabel, resolveHerdrAgentLabels, resolveHerdrLocations } from "./herdr-location.ts";
 import { createHerdrClient, type HerdrClient, type HerdrResult } from "./project-agent.ts";
 import type { SessionInfo } from "./types.ts";
 
@@ -114,6 +114,21 @@ test("does not invoke Herdr or change roster shape when every session is non-Her
   assert.deepEqual(resolved, inputs);
   assert.deepEqual(herdr.calls, []);
   assert.equal(resolved.some((item) => "herdrLocation" in item), false);
+});
+
+test("role discovery includes only panes in the viewer's current workspace", async () => {
+  const location = { status: "current" as const, workspace: { id: "w1", label: "Main" }, tab: { id: "t1", label: "Current" }, paneId: "self", refreshedAt: 42 };
+  const data = { snapshot: { panes: [
+    { workspace_id: "w1", pane_id: "self", tab_id: "t1" },
+    { workspace_id: "w1", pane_id: "offline", tab_id: "t2", display_agent: "wtree" },
+    { workspace_id: "w2", pane_id: "outside", tab_id: "t3", display_agent: "wtree" },
+  ] } };
+  const herdr = client([{ ok: true, data }]);
+  assert.deepEqual(await listRoleWorkspacePanes(location, herdr), [
+    { paneId: "self", tabId: "t1", label: undefined },
+    { paneId: "offline", tabId: "t2", label: "wtree" },
+  ]);
+  assert.equal(await listRoleWorkspacePanes({ ...location, paneId: "moved" }, client([{ ok: true, data }])), undefined);
 });
 
 test("resolves hosted and non-Herdr sessions from one current snapshot", async () => {

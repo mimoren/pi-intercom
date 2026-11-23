@@ -25,6 +25,7 @@
     "project-agent.ts",
     "reply-tracker.ts",
     "role-bridge.ts",
+    "role-consult.ts",
     "session-mentions.ts",
     "broker/**/*.ts",
     "ui/**/*.ts",

@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Component, TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
@@ -319,7 +319,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
   const broker = spawn(process.execPath, [
     ...tsxImportArgs,
     "-e",
-    "Object.defineProperty(process, 'platform', { value: 'win32' }); import('./broker/broker.ts').catch((error) => { console.error(error); process.exit(1); });",
+    "Object.defineProperty(process, 'platform', { value: 'win32' }); import('./broker/broker.ts').then(({ IntercomBroker }) => new IntercomBroker().start()).catch((error) => { console.error(error); process.exit(1); });",
   ], {
     cwd: repoDir,
     env: {
@@ -419,7 +419,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     assert.deepEqual(registerMessages, [{
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1", "role-routing-v1"],
+      features: ["extension-bus-v1", "exact-send-v1", "role-routing-v1", "role-consult-v1"],
     }]);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
@@ -430,8 +430,11 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
   }
 });
 
-async function setupClients() {
-  const broker = spawn(process.execPath, [...tsxImportArgs, path.join(repoDir, "broker", "broker.ts")], {
+async function setupClients(authenticateOwner?: boolean) {
+  const brokerArgs = authenticateOwner === undefined
+    ? [path.join(repoDir, "broker", "broker.ts")]
+    : ["--input-type=module", "-e", `import { IntercomBroker } from './broker/broker.ts'; new IntercomBroker(async () => ${authenticateOwner}).start();`];
+  const broker = spawn(process.execPath, [...tsxImportArgs, ...brokerArgs], {
     cwd: repoDir,
     env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
     stdio: ["ignore", "pipe", "pipe"],
@@ -523,12 +526,13 @@ function waitForOutboxResults(results: IntercomOutboxResultV1[], count: number, 
   });
 }
 
-async function waitForCondition(condition: () => boolean, description: string): Promise<void> {
+async function waitForCondition(condition: () => boolean | Promise<boolean>, description: string): Promise<void> {
   const deadline = Date.now() + 3000;
-  while (!condition() && Date.now() < deadline) {
+  do {
+    if (await condition()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.ok(condition(), `Timed out waiting for ${description}`);
+  } while (Date.now() < deadline);
+  assert.fail(`Timed out waiting for ${description}`);
 }
 
 async function waitForReplyMessage(messages: Message[], messageId: string, timeoutMs = 3000): Promise<Message> {
@@ -1283,16 +1287,18 @@ test("workspace rosters include direct worktree relatives while explicit messagi
   const fixtureBin = path.join(fixtureDir, "herdr-fixture");
   const workspaceIds = ["scope-main", "scope-child", "scope-sibling", "scope-unrelated"];
   const snapshot = {
-    panes: workspaceIds.map(id => ({ pane_id: `${id}:pane`, tab_id: `${id}:tab`, workspace_id: id })),
-    tabs: workspaceIds.map(id => ({ tab_id: `${id}:tab`, workspace_id: id, label: id })),
+    panes: [...workspaceIds.map(id => ({ pane_id: `${id}:pane`, tab_id: `${id}:tab`, workspace_id: id })),
+      ...["role-a", "role-b", "role-unknown", "role-offline"].map(id => ({ pane_id: id, tab_id: "roles-tab", workspace_id: "scope-child" }))],
+    tabs: [...workspaceIds.map(id => ({ tab_id: `${id}:tab`, workspace_id: id, label: id })),
+      { tab_id: "roles-tab", workspace_id: "scope-child", label: "Roles" }],
     workspaces: workspaceIds.map((id, index) => ({ workspace_id: id, label: id, worktree: {
       repo_key: index === 3 ? "/other/.git" : "/repo/.git", is_linked_worktree: index === 1 || index === 2,
     } })),
   };
   writeFileSync(fixtureBin, `#!/usr/bin/env node\nconsole.log(${JSON.stringify(JSON.stringify({ result: { snapshot } }))});\n`);
   chmodSync(fixtureBin, 0o755);
-  const peers = [new IntercomClient(), new IntercomClient(), new IntercomClient()];
-  const [main, sibling, outside] = peers as [IntercomClient, IntercomClient, IntercomClient];
+  const peers = Array.from({ length: 6 }, () => new IntercomClient());
+  const [main, sibling, outside, roleA, roleB, unknown] = peers as [IntercomClient, IntercomClient, IntercomClient, IntercomClient, IntercomClient, IntercomClient];
   const harness = createExtensionHarness("scope-child-author", { sessionId: "scope-author-full-id" });
   try {
     await withEnv("HERDR_BIN", fixtureBin, async () => {
@@ -1373,6 +1379,28 @@ test("workspace rosters include direct worktree relatives while explicit messagi
               assert.equal(ids.includes("scope-sibling-full-id"), global);
               assert.ok(ids.includes("scope-main-full-id"));
             }
+            for (const [peer, id, cwd, role] of [
+              [roleA, "role-a", repoDir, { id: "wtree", source: "pi-user" }],
+              [roleB, "role-b", "/repo/other", { id: "wtree", source: "pi-project" }],
+              [unknown, "role-unknown", repoDir, undefined],
+            ] as const) {
+              await peer.connect({ name: id, cwd, model: "test", pid: process.pid, startedAt: 1, lastActivity: 1, herdrPaneId: id, role }, id);
+            }
+            harness.pi.events.on("agent-flag:directory", (input) => {
+              (input as { reply(value: unknown): void }).reply({ version: 1, sessionId: "scope-author-full-id", roles: [
+                { id: "wtree", source: "pi-user", scope: "global", client: "pi" },
+              ] });
+            });
+            const roles = JSON.parse((await call({ action: "roles" })).content[0]!.text);
+            assert.equal(roles.workspaceId, "scope-child");
+            assert.deepEqual(roles.installed.map((role: { id: string }) => role.id), ["wtree"]);
+            assert.deepEqual(Object.fromEntries(roles.instances.map((row: { paneId: string; state: string }) => [row.paneId, row.state])), {
+              "scope-child:pane": "unknown", "role-a": "active", "role-b": "active", "role-unknown": "unknown", "role-offline": "unreachable",
+            });
+            const filtered = JSON.parse((await call({ action: "roles", roleId: "wtree", cwd: repoDir })).content[0]!.text);
+            assert.deepEqual(filtered.instances.map((row: { sessionId: string }) => row.sessionId), ["role-a"]);
+            assert.equal(typeof filtered.instances[0].roleEpoch, "string");
+            assert.equal(typeof filtered.instances[0].endpointEpoch, "string");
           });
         } finally {
           await harness.emitLifecycle("session_shutdown");
@@ -6542,6 +6570,92 @@ test("registered inline renderer follows real CustomMessageComponent rebuild and
       if (descriptor) Object.defineProperty(globalThis, key, descriptor);
       else Reflect.deleteProperty(globalThis, key);
     });
+  }
+});
+
+test("an owner grant permits a same-workspace cross-tab role consultation and can be revoked", { concurrency: false, skip: process.platform === "win32" }, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-intercom-consult-"));
+  const fixture = path.join(root, "herdr-fixture");
+  const topology = path.join(root, "snapshot.json");
+  const main = path.join(root, "main");
+  const checkout = path.join(root, "review");
+  const author = new IntercomClient();
+  const peer = new IntercomClient();
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+  const setTopology = (peerWorkspace: string) => writeFileSync(topology, JSON.stringify({ result: { snapshot: {
+    panes: [{ pane_id: "author-pane", tab_id: "author-tab", workspace_id: "test-workspace" }, { pane_id: "peer-pane", tab_id: "peer-tab", workspace_id: peerWorkspace }],
+    tabs: [{ tab_id: "author-tab", label: "Wtdog" }, { tab_id: "peer-tab", label: "Wtree" }],
+    workspaces: [{ workspace_id: "test-workspace", label: "Fixture" }, { workspace_id: "other-workspace", label: "Other" }],
+  } } }));
+  try {
+    mkdirSync(main);
+    git(main, "init", "-q", "-b", "main");
+    git(main, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "--allow-empty", "-m", "fixture");
+    git(main, "worktree", "add", "-q", "-b", "review", checkout);
+    git(checkout, "tag", "v0.0.1-fixture");
+    writeFileSync(fixture, `#!/usr/bin/env node\nconsole.log(require('node:fs').readFileSync(${JSON.stringify(topology)}, 'utf8'));\n`);
+    chmodSync(fixture, 0o755);
+    setTopology("test-workspace");
+    await withEnv("HERDR_BIN", fixture, async () => {
+      const setup = await setupClients(true);
+      try {
+        const base = { cwd: main, model: "test", pid: process.pid, startedAt: 1, lastActivity: 1 };
+        await author.connect({ ...base, name: "wtdog", herdrPaneId: "author-pane", role: { id: "wtdog" } }, "wtdog-fixture");
+        await peer.connect({ ...base, name: "wtree", herdrPaneId: "peer-pane", role: { id: "wtree" } }, "wtree-fixture");
+        const target = (await author.listSessions({ global: true })).find((item) => item.id === "wtree-fixture")!;
+        const scope = { taskId: "fixture-task", workspaceId: "test-workspace" };
+        const options = { text: "Confirm checkout, branch, tag and commit", expectsReply: true, targetEpoch: target.endpointEpoch, targetRoleEpoch: target.roleEpoch, consultation: scope };
+        let deliveries = 0;
+        peer.on("message", () => deliveries++);
+        assert.equal((await author.send(target.id, options)).code, "E_ROLE_GRANT");
+        assert.equal(deliveries, 0);
+        assert.equal((await author.changeRoleGrant({ taskId: scope.taskId, roleId: "wtree" })).delivered, true);
+        setTopology("other-workspace");
+        assert.equal((await author.send(target.id, options)).code, "E_ROLE_WORKSPACE");
+        assert.equal(deliveries, 0);
+        setTopology("test-workspace");
+        const received = once(peer, "message") as Promise<[SessionInfo, Message]>;
+        const idempotent = { ...options, messageId: "consult-fixture-request" };
+        const result = await author.send(target.id, idempotent);
+        assert.equal(result.delivered, true);
+        const [sender, incoming] = await received;
+        assert.equal(sender.id, "wtdog-fixture");
+        assert.equal(incoming.id, result.id);
+        const reply = once(author, "message") as Promise<[SessionInfo, Message]>;
+        const evidence = { checkout: git(checkout, "rev-parse", "--show-toplevel"), branch: git(checkout, "branch", "--show-current"), head: git(checkout, "rev-parse", "HEAD"), version: "v0.0.1-fixture" };
+        assert.equal((await peer.send(sender.id, { text: JSON.stringify(evidence), replyTo: incoming.id })).delivered, true);
+        const [respondent, response] = await reply;
+        assert.equal(respondent.id, target.id);
+        assert.equal(response.replyTo, result.id);
+        assert.deepEqual(JSON.parse(response.content.text), { checkout: git(checkout, "rev-parse", "--show-toplevel"), branch: "review", head: git(main, "rev-parse", "v0.0.1-fixture^{commit}"), version: "v0.0.1-fixture" });
+        assert.equal((await author.send(target.id, idempotent)).delivered, true);
+        assert.equal(deliveries, 1);
+        assert.equal((await author.send(target.id, { ...idempotent, consultation: undefined })).code, "E_MESSAGE_ID_REUSE");
+        peer.updatePresence({ role: { id: "release" } });
+        await waitForCondition(async () => (await author.listSessions({ global: true })).find((row) => row.id === target.id)?.role?.id === "release", "role changed");
+        assert.equal((await author.send(target.id, options)).code, "E_ROLE_CHANGED");
+        peer.updatePresence({ role: { id: "wtree" } });
+        await waitForCondition(async () => (await author.listSessions({ global: true })).find((row) => row.id === target.id)?.role?.id === "wtree", "role restored");
+        const current = (await author.listSessions({ global: true })).find((row) => row.id === target.id)!;
+        const next = { ...options, targetRoleEpoch: current.roleEpoch };
+        for (let index = 0; index < 9; index++) {
+          const sent = await author.send(target.id, next);
+          assert.equal(sent.delivered, true);
+          await author.cancelAsk(sent.id);
+        }
+        assert.equal((await author.send(target.id, next)).code, "E_ROLE_GRANT");
+        assert.equal(deliveries, 10);
+        assert.equal((await author.changeRoleGrant({ taskId: scope.taskId, roleId: "wtree" })).delivered, true);
+        assert.equal((await author.changeRoleGrant()).delivered, true);
+        assert.equal((await author.send(target.id, next)).code, "E_ROLE_GRANT");
+        assert.equal(deliveries, 10);
+      } finally {
+        await Promise.all([author.disconnect(), peer.disconnect()]);
+        await setup.cleanup();
+      }
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

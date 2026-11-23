@@ -5,6 +5,7 @@ import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
 import { getIntercomScopeId } from "../config.ts";
+import { ROLE_CONSULT_FEATURE } from "../role-consult.ts";
 import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, ROLE_ROUTING_FEATURE, SESSION_HELD_ERROR_CODE, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
@@ -33,6 +34,7 @@ interface SendOptions {
   /** Also pin the target's role revision. Requires `targetEpoch`, and a broker with
    *  role routing: an older broker would ignore it and deliver anyway. */
   targetRoleEpoch?: string;
+  consultation?: { taskId: string; workspaceId: string };
   supersedes?: string;
   retryOf?: string;
   provenance?: MessageProvenance;
@@ -642,6 +644,32 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
+  changeRoleGrant(scope?: { taskId: string; roleId: string }): Promise<SendResult> {
+    if (!this.supportsFeature(ROLE_CONSULT_FEATURE)) return Promise.reject(new Error("Broker does not support consultation grants"));
+    const requestId = randomUUID();
+    return this.requestDelivery(this.requireActiveSocket(), requestId, { type: "role_grant", requestId, ...scope }, 55_000);
+  }
+
+  private requestDelivery(socket: net.Socket, messageId: string, frame: ClientMessage, timeoutMs = 10_000): Promise<SendResult> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingSends.delete(messageId);
+        reject(new Error("Delivery request timeout"));
+      }, timeoutMs);
+      this.pendingSends.set(messageId, {
+        resolve: (result) => { clearTimeout(timeout); resolve(result); },
+        reject: (error) => { clearTimeout(timeout); reject(error); },
+      });
+      try {
+        writeMessage(socket, frame);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingSends.delete(messageId);
+        reject(toError(error));
+      }
+    });
+  }
+
   async send(to: string, options: SendOptions): Promise<SendResult> {
     let socket: net.Socket;
     try {
@@ -668,32 +696,15 @@ export class IntercomClient extends EventEmitter {
       },
     };
 
-    const sendOnce = (targetId?: string, targetEpoch?: string, targetRoleEpoch?: string): Promise<SendResult> => new Promise((resolve, reject) => {
-      const wrappedResolve = (result: SendResult) => {
-        clearTimeout(timeout);
-        resolve(result);
-      };
-      const wrappedReject = (error: Error) => {
-        clearTimeout(timeout);
-        reject(error);
-      };
-      const timeout = setTimeout(() => {
-        if (this.pendingSends.has(messageId)) {
-          this.pendingSends.delete(messageId);
-          wrappedReject(new Error("Send timeout"));
-        }
-      }, 10000);
-      this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
-
-      try {
-        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch, ...(targetRoleEpoch !== undefined ? { targetRoleEpoch } : {}) } : {}) });
-      } catch (error) {
-        clearTimeout(timeout);
-        this.pendingSends.delete(messageId);
-        reject(toError(error));
-      }
+    const sendOnce = (targetId?: string, targetEpoch?: string, targetRoleEpoch?: string) => this.requestDelivery(socket, messageId, {
+      type: "send", to, message,
+      ...(targetId && targetEpoch ? { targetId, targetEpoch, ...(targetRoleEpoch !== undefined ? { targetRoleEpoch } : {}) } : {}),
+      ...(options.consultation !== undefined ? { consultation: options.consultation } : {}),
     });
 
+    if (options.consultation !== undefined && (!this.supportsFeature(ROLE_CONSULT_FEATURE) || !options.targetRoleEpoch || !options.targetEpoch)) {
+      throw new Error("Consultation requires broker support and an exact role selection");
+    }
     if (options.targetRoleEpoch !== undefined) {
       // Presence, not truthiness: an explicit empty string is a caller mistake and
       // must fail here, not quietly turn into an ordinary endpoint or alias send.

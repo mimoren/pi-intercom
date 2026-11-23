@@ -39,8 +39,9 @@ import { relaySenderName } from "./cross-machine-envelope.ts";
 import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
 import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import { formatHandoverMessage, generateHandoverBody, readGitState } from "./handover.ts";
-import { resolveHerdrAgentLabels } from "./herdr-location.ts";
-import { AGENT_FLAG_CHANGED_EVENT, AGENT_FLAG_READY_EVENT, RoleRevisionGate, requestAgentRoleSnapshot, rolePresenceOf, type AgentRoleSnapshot } from "./role-bridge.ts";
+import { listRoleWorkspacePanes, resolveHerdrAgentLabels } from "./herdr-location.ts";
+import { validConsultId } from "./role-consult.ts";
+import { AGENT_FLAG_CHANGED_EVENT, AGENT_FLAG_READY_EVENT, RoleRevisionGate, requestAgentRoleSnapshot, requestRoleDirectory, rolePresenceOf, type AgentRoleSnapshot } from "./role-bridge.ts";
 import { isIdleWakePending, releaseIdleWake, reserveIdleWake } from "./idle-wake.ts";
 import { createSessionMentionProvider, extractSessionMentions, globalMentionPeers, notificationContext, notificationPrompt, resolveSessionMentionBinding, resolveSessionMentions, sessionMentionBinding, sessionMentionContext, sessionMentionDescription, sessionMentionIdentity, sessionMentionLabel, synthesizedSessionAlias, workspaceMentionPeers, MENTION_OWNER_EVENT, MENTION_READY_EVENT, type MentionOwnerV1, type MentionProviderV1, type MentionRecipient, type MentionScope, type SessionMentionBinding } from "./session-mentions.ts";
 
@@ -2889,6 +2890,8 @@ by "list" (a leading prefix of the ID is enough). Prefer the short id when two
 sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.
 
 Usage:
+  intercom({ action: "roles" })                   → Query installed and online roles in the exact current Herdr workspace
+  intercom({ action: "consult", to: "exact-session-id", consultation: { taskId, workspaceId, endpointEpoch, roleEpoch }, message: "question" }) → Ask a role under an approved read-only task grant
   intercom({ action: "list" })                    → List sessions in the current Herdr workspace and its parent/child worktrees
   intercom({ action: "list", global: true })      → List all local sessions; cross-workspace messaging needs no flag
   intercom({ action: "list-cwd" })                → List sessions in the current working directory
@@ -2907,8 +2910,10 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "notify", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'notify', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'notify' sends an AI-composed new message to an exact session ID, without inferring a reply. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
+      roleId: Type.Optional(Type.String({ description: "Filter installed and online roles by canonical ID for the roles action." })),
+      consultation: Type.Optional(Type.Object({ taskId: Type.String(), workspaceId: Type.String(), endpointEpoch: Type.String(), roleEpoch: Type.String() })),
+      action: StringEnum(["consult", "roles", "list", "list-cwd", "send", "notify", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
+        description: "Use 'roles' for role discovery and 'consult' for an approved read-only query to a selected role. Other actions handle session messaging and delivery status.",
       }),
       global: Type.Optional(Type.Boolean({
         description: "Only for list/list-cwd: include all local sessions across Herdr workspaces. Explicit send/notify/ask/reply/handover targets always resolve globally without this flag; an explicit false is treated as absent, while true on any other action is refused.",
@@ -2976,6 +2981,36 @@ Usage:
       }
 
       switch (action) {
+        case "roles": {
+          try {
+            const directory = requestRoleDirectory(pi.events, ctx.sessionManager.getSessionId());
+            const installed = directory?.filter((role) => !params.roleId || role.id === params.roleId) ?? null;
+            const sessions = await connectedClient.listSessions({ global: true });
+            const location = sessions.find((row) => row.id === connectedClient.sessionId)?.herdrLocation;
+            const panes = location?.status === "current" ? await listRoleWorkspacePanes(location) : undefined;
+            const workspaceId = panes && location?.status === "current" ? location.workspace.id : null;
+            const projectPath = cwd ? resolvePath(ctx.cwd, cwd) : undefined;
+            const instances = panes && workspaceId ? panes.flatMap((pane): Record<string, unknown>[] => {
+              const rows = sessions.filter((row) => row.herdrLocation?.status === "current" && row.herdrLocation.workspace.id === workspaceId && row.herdrLocation.paneId === pane.paneId && row.herdrLocation.tab.id === pane.tabId);
+              if (rows.length === 0) return params.roleId || projectPath ? [] : [{ ...pane, state: "unreachable" }];
+              return rows.filter((row) => (!params.roleId || row.role?.id === params.roleId) && (!projectPath || resolvePath(row.cwd) === projectPath)).map((row) => ({
+                ...pane,
+                state: row.roleState ?? "unknown",
+                sessionId: row.id,
+                endpointEpoch: row.endpointEpoch,
+                roleEpoch: row.roleEpoch,
+                role: row.role,
+                cwd: row.cwd,
+                status: row.status,
+                observedAt: row.herdrLocation?.status === "current" ? row.herdrLocation.refreshedAt : undefined,
+              }));
+            }) : [];
+            const result = { installed, workspaceId, instances };
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+          } catch (error) {
+            return { content: [{ type: "text", text: `Role discovery failed: ${getErrorMessage(error)}` }], details: { error: true } };
+          }
+        }
         case "list": {
           try {
             const mySessionId = connectedClient.sessionId;
@@ -3133,7 +3168,12 @@ Usage:
           return deliverMessage(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true });
         }
 
+        case "consult":
         case "ask": {
+          const scope = action === "consult" ? params.consultation : undefined;
+          if (action === "consult" && (!to || cwd || !scope || ![scope.taskId, scope.workspaceId, scope.endpointEpoch, scope.roleEpoch].every(validConsultId) || replyTo || supersedes || retryOf || attachments?.length || openProjectPaneIfMissing)) {
+            return { content: [{ type: "text", text: "Consultation requires an exact session, workspace and epoch selection, plus an approved task ID." }], details: { error: true } };
+          }
           if ((!to && !cwd) || !message) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
@@ -3172,7 +3212,9 @@ Usage:
               };
             }
             let target: DeliveryTarget;
-            if (cwd) {
+            if (scope) {
+              target = { id: to!, label: to! };
+            } else if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
             } else {
               target = { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
@@ -3197,7 +3239,12 @@ Usage:
                 details: { error: true },
               };
             }
-            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, { text: message, attachments, replyTo, supersedes, retryOf }, {
+            const payload = scope ? {
+              text: `Read-only role consultation for task ${scope.taskId}. Return evidence without making changes.\n\n${message}`,
+              targetEpoch: scope.endpointEpoch, targetRoleEpoch: scope.roleEpoch,
+              consultation: { taskId: scope.taskId, workspaceId: scope.workspaceId },
+            } : { text: message, attachments, replyTo, supersedes, retryOf };
+            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd || scope ? "" : to!, firstTarget: sendTo, display: targetDisplay }, payload, {
               signal: _signal,
               onAttempt: (askId) => { questionId = askId; },
               deliveryState: () => latestDeliveryState(questionId, deliveryState),
@@ -3219,6 +3266,7 @@ Usage:
             pi.appendEntry("intercom_sent", {
               to: askTarget,
               message: { text: message, attachments, replyTo, supersedes, retryOf },
+              ...(scope ? { consultation: scope } : {}),
               messageId: sendResult.id,
               timestamp: Date.now(),
             });
@@ -3721,6 +3769,27 @@ Usage:
   pi.registerCommand("intercom", {
     description: "Open session intercom overlay",
     handler: async (_args, ctx) => openIntercomOverlay(ctx),
+  });
+
+  pi.registerCommand("intercom-role-grant", {
+    description: "Approve read-only role consultation via Touch ID. Usage: /intercom-role-grant <task-id> <role-id> | revoke",
+    handler: async (args, ctx) => {
+      const inputs = args.trim().split(/\s+/);
+      const [taskId, roleId] = inputs;
+      const revoke = inputs.length === 1 && taskId === "revoke";
+      if (!revoke && (inputs.length !== 2 || !validConsultId(taskId) || !validConsultId(roleId))) {
+        ctx.ui.notify("Usage: /intercom-role-grant <task-id> <role-id> | revoke", "warning");
+        return;
+      }
+      try {
+        if (!client) throw new Error("Intercom is not connected");
+        const result = await client.changeRoleGrant(revoke ? undefined : { taskId: taskId!, roleId: roleId! });
+        const notice = revoke ? "Consultation grant revoked" : `Consultation grant active for ${taskId}`;
+        ctx.ui.notify(result.delivered ? notice : result.reason ?? "Consultation grant denied", result.delivered ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(getErrorMessage(error), "warning");
+      }
+    },
   });
 
   pi.registerCommand("intercom-id", {

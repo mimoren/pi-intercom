@@ -88,6 +88,31 @@ export async function resolveHerdrAgentLabels(
   });
 }
 
+interface WorkspaceRolePane {
+  paneId: string;
+  tabId: string;
+  label?: string;
+}
+
+/** Corroborate the broker's live location and return panes from that exact workspace. */
+export async function listRoleWorkspacePanes(
+  location: Extract<HerdrLocation, { status: "current" }>,
+  client = createHerdrClient(),
+): Promise<WorkspaceRolePane[] | undefined> {
+  const result = await readCurrentSnapshot(client);
+  if (!result.ok) return undefined;
+  const envelope = record(result.data);
+  const panes = recordsField(record(envelope?.snapshot) ?? envelope, "panes");
+  if (!panes) return undefined;
+  const scoped = panes.flatMap((pane) => {
+    const paneId = stringField(pane, "pane_id");
+    const tabId = stringField(pane, "tab_id");
+    if (!paneId || !tabId || stringField(pane, "workspace_id") !== location.workspace.id) return [];
+    return [{ paneId, tabId, label: paneAgentLabel(pane) }];
+  });
+  return scoped.some((pane) => pane.paneId === location.paneId && pane.tabId === location.tab.id) ? scoped : undefined;
+}
+
 /** Filter only the roster view; explicit session addressing remains available. */
 export function filterSessionsByLocationScope(
   sessions: SessionInfo[], selfId: string, scope: ListLocationScope,

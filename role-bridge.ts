@@ -109,6 +109,32 @@ export function requestAgentRoleSnapshot(events: EventBusLike): AgentRoleSnapsho
   return parseAgentRoleSnapshot(received);
 }
 
+export interface PublicRole {
+  id: string;
+  source: "pi-user" | "pi-project";
+  scope: "global" | "project";
+  client: "pi";
+  description?: string;
+}
+
+export function requestRoleDirectory(events: EventBusLike, sessionId: string): PublicRole[] | undefined {
+  let reply: unknown;
+  let answered = false;
+  events.emit("agent-flag:directory", { version: AGENT_ROLE_SNAPSHOT_VERSION, reply: (value: unknown) => {
+    if (!answered) { answered = true; reply = value; }
+  } });
+  if (!isRecord(reply) || reply.version !== AGENT_ROLE_SNAPSHOT_VERSION || reply.sessionId !== sessionId || !Array.isArray(reply.roles)) return undefined;
+  const roles: PublicRole[] = [];
+  for (const row of reply.roles) {
+    if (!isRecord(row)) return undefined;
+    const id = nonEmptyString(row.id);
+    const { source, scope, client, description } = row;
+    if (!id || (source !== "pi-user" && source !== "pi-project") || scope !== (source === "pi-project" ? "project" : "global") || client !== "pi" || (description !== undefined && typeof description !== "string")) return undefined;
+    roles.push({ id, source, scope, client, ...(description === undefined ? {} : { description }) });
+  }
+  return roles;
+}
+
 /**
  * The revision the broker stores next to the role. It identifies the producer
  * instance and its generation, so the broker can rotate its own `roleEpoch` on
