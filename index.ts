@@ -40,6 +40,7 @@ import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
 import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import { formatHandoverMessage, generateHandoverBody, readGitState } from "./handover.ts";
 import { resolveHerdrAgentLabels } from "./herdr-location.ts";
+import { AGENT_FLAG_CHANGED_EVENT, AGENT_FLAG_READY_EVENT, RoleRevisionGate, requestAgentRoleSnapshot, rolePresenceOf, type AgentRoleSnapshot } from "./role-bridge.ts";
 import { isIdleWakePending, releaseIdleWake, reserveIdleWake } from "./idle-wake.ts";
 import { createSessionMentionProvider, extractSessionMentions, globalMentionPeers, notificationContext, notificationPrompt, resolveSessionMentionBinding, resolveSessionMentions, sessionMentionBinding, sessionMentionContext, sessionMentionDescription, sessionMentionIdentity, sessionMentionLabel, synthesizedSessionAlias, workspaceMentionPeers, MENTION_OWNER_EVENT, MENTION_READY_EVENT, type MentionOwnerV1, type MentionProviderV1, type MentionRecipient, type MentionScope, type SessionMentionBinding } from "./session-mentions.ts";
 
@@ -1090,6 +1091,24 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     lastPresenceRuntimeFallbackAlias = identity.runtimeFallbackAlias;
     client.updatePresence({ ...identity, status: currentStatus(), ...currentContextUsage() });
   }
+  // Role identity comes from CLIM's snapshot, never from this session's title or
+  // the Herdr label. A missing producer answer leaves the role unknown, which is
+  // not the same as a session that has confirmed it has no role.
+  const roleRevisionGate = new RoleRevisionGate();
+  function publishAgentRole(options: { force?: boolean } = {}): void {
+    if (!client || !getLiveContext() || !currentSessionId) return;
+    let snapshot: AgentRoleSnapshot | undefined;
+    try {
+      snapshot = requestAgentRoleSnapshot(pi.events);
+    } catch {
+      // A producer that throws is unknown, not role-less; keep the brokers state untouched.
+      return;
+    }
+    if (!snapshot || snapshot.sessionId !== currentSessionId) return;
+    if (!roleRevisionGate.accept(snapshot, options)) return;
+    const presence = rolePresenceOf(snapshot);
+    if (presence) client.updatePresence(presence);
+  }
   function startNamePoll(): void {
     clearNamePollTimer();
     const initialIdentity = currentSessionId ? buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId) : null;
@@ -1500,6 +1519,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           for (const namespace of localExtensions.keys()) {
             emitLocalExtensionEvent(namespace, { type: "connection", connected: true, supported });
           }
+          // A new broker endpoint starts with no role for this session, so the
+          // current snapshot is republished even when it has not changed.
+          publishAgentRole({ force: true });
           break;
         }
         case "extension_owner": {
@@ -2245,6 +2267,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     clearNamePollTimer();
     rejectReplyWaiter(new Error("Session replaced"));
     replyTracker.reset();
+    // The role belongs to the session that reported it; a switch starts unknown.
+    roleRevisionGate.reset();
     if (previousClient) {
       client = null;
       void previousClient.disconnect().catch(() => undefined);
@@ -2381,6 +2405,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     });
   });
   const unsubscribeOutboxRequest = pi.events.on(INTERCOM_OUTBOX_REQUEST_EVENT, handleOutboxRequest);
+  // Both events only mean "ask again": the snapshot is the single truth, so a
+  // changed event that arrives before the producer is ready costs one empty ask.
+  const unsubscribeAgentRoleChanged = pi.events.on(AGENT_FLAG_CHANGED_EVENT, () => publishAgentRole());
+  const unsubscribeAgentRoleReady = pi.events.on(AGENT_FLAG_READY_EVENT, () => publishAgentRole());
   const unsubscribeMentionReady = pi.events.on(MENTION_READY_EVENT, () => {
     stopLegacyMentions();
     discoverMentionOwner();
@@ -2460,6 +2488,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     unsubscribeSubagentControlIntercom();
     unsubscribeSubagentResultIntercom();
     unsubscribeOutboxRequest();
+    unsubscribeAgentRoleChanged();
+    unsubscribeAgentRoleReady();
     unsubscribeMentionReady();
     try { unregisterMentionProvider?.(); } catch (error) { reportMentionOwnerError(error); }
     unregisterMentionProvider = undefined;

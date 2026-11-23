@@ -6544,3 +6544,77 @@ test("registered inline renderer follows real CustomMessageComponent rebuild and
     });
   }
 });
+
+test("extension publishes the CLIM role snapshot to the broker", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { AGENT_FLAG_CHANGED_EVENT, AGENT_FLAG_GET_EVENT, AGENT_FLAG_READY_EVENT } = await import("./role-bridge.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("role-worker", { sessionId: "role-worker-session" });
+  const piSessionId = "role-worker-session";
+  // A stand-in for CLIM: it answers the snapshot request only once it is ready,
+  // which is exactly the load order the consumer has to survive.
+  let current: unknown;
+  harness.pi.events.on(AGENT_FLAG_GET_EVENT, (payload) => {
+    const reply = (payload as { reply?: (value: unknown) => void }).reply;
+    if (current !== undefined) reply?.(current);
+  });
+  const roleRow = async (predicate: (session: SessionInfo) => boolean): Promise<SessionInfo> => {
+    const deadline = Date.now() + 3000;
+    for (;;) {
+      const row = (await planner.listSessions({ global: true })).find((session) => session.id === piSessionId);
+      if (row && predicate(row)) return row;
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for the role row; last saw ${JSON.stringify(row)}`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  };
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "role-worker");
+
+    // No snapshot yet: the session must stay unknown, not become "no role".
+    const unknown = await roleRow(() => true);
+    assert.equal(unknown.role, undefined);
+    assert.equal(unknown.roleEpoch, undefined);
+    assert.equal(unknown.roleState, undefined);
+
+    // Ready announces initialization with an active role.
+    current = { version: 1, sessionId: piSessionId, state: "active", producerEpoch: "prod-1", generation: 1, role: { id: "kaoru", source: "project:/repo" } };
+    harness.pi.events.emit(AGENT_FLAG_READY_EVENT, { version: 1 });
+    const active = await roleRow((session) => session.role?.id === "kaoru");
+    assert.equal(active.roleState, "active");
+    assert.deepEqual(active.role, { id: "kaoru", source: "project:/repo" });
+    const firstEpoch = active.roleEpoch;
+    assert.equal(typeof firstEpoch, "string");
+
+    // A repeated snapshot must not rotate the epoch.
+    harness.pi.events.emit(AGENT_FLAG_CHANGED_EVENT, { name: "kaoru", source: "command" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await roleRow(() => true)).roleEpoch, firstEpoch);
+
+    // A producer reload of the same role rotates it.
+    current = { version: 1, sessionId: piSessionId, state: "active", producerEpoch: "prod-2", generation: 0, role: { id: "kaoru", source: "project:/repo" } };
+    harness.pi.events.emit(AGENT_FLAG_CHANGED_EVENT, { name: "kaoru", source: "restore" });
+    const reloaded = await roleRow((session) => typeof session.roleEpoch === "string" && session.roleEpoch !== firstEpoch);
+    assert.equal(reloaded.role?.id, "kaoru");
+
+    // Clearing is a definite answer, and it survives the next roster read.
+    current = { version: 1, sessionId: piSessionId, state: "no_role", producerEpoch: "prod-2", generation: 1 };
+    harness.pi.events.emit(AGENT_FLAG_CHANGED_EVENT, { source: "clear" });
+    const cleared = await roleRow((session) => session.roleState === "no_role");
+    assert.equal(cleared.role, undefined);
+    assert.equal(cleared.roleEpoch, undefined);
+
+    // A snapshot for another session must never be applied to this one.
+    current = { version: 1, sessionId: "some-other-session", state: "active", producerEpoch: "prod-3", generation: 0, role: { id: "impostor" } };
+    harness.pi.events.emit(AGENT_FLAG_CHANGED_EVENT, { name: "impostor" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const stillCleared = await roleRow(() => true);
+    assert.equal(stillCleared.roleState, "no_role");
+    assert.equal(stillCleared.role, undefined);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
